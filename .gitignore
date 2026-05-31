@@ -1,0 +1,43 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Data (large files — sync separately or download on cluster)
+data/images/
+data/raw/oven_wikidata_chains_cleaned_labels.jsonl
+data/raw/oven_entity_val.jsonl
+data/raw/ovenid2impath.csv
+data/raw/wikidb_aka_oven_sample.jsonl
+
+# Results (generated on cluster, synced back)
+results/
+
+# Logs
+logs/
+slurm/
+
+# OS
+.DS_Store
+
+# uv
+uv.lock
+
+# Environment (cluster secrets)
+.env
+
+# User-specific config (sync targets, cluster paths)
+configs/sync.conf
+commands.md

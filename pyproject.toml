@@ -1,0 +1,48 @@
+[project]
+name = "oven-mllm-eval"
+version = "0.1.0"
+description = "Taxonomy-aware evaluation of multimodal LLMs on OVEN"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "tqdm>=4.66",
+    "pillow>=10",
+]
+
+[project.optional-dependencies]
+# For building the taxonomy index from raw OVEN chains (offline only)
+build-index = [
+    "networkx>=3.2",
+]
+# For starting the vLLM inference server on the cluster
+# Uses the pre-built wheel for the cluster's CUDA version.
+# Install with:  uv sync --extra serve
+# Locally (no GPU): just use  uv sync  — you don't need this.
+serve = [
+    # Replace with your cluster's vllm wheel path or use the PyPI package:
+    #   "vllm>=0.11",
+    "vllm @ file:///leonardo_scratch/fast/<YOUR_ACCOUNT>/vllm_wheel/vllm-0.11.2-cp38-abi3-manylinux1_x86_64.whl",
+]
+# For exploratory data analysis and plotting
+analysis = [
+    "pandas>=2.2",
+    "matplotlib>=3.8",
+    "seaborn>=0.13",
+    "pyvis>=0.3",
+]
+dev = [
+    "pytest>=8",
+    "ruff>=0.6",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/oven_mllm_eval"]
+
+[tool.ruff]
+line-length = 120
