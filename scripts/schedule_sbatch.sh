@@ -44,7 +44,7 @@ Inference options:
 Scoring options:
     --scoring-measure <MEASURE>   Measure(s) for DirectMeasureMatcher: exact_match, contained, all
                                   (default: exact_match).  Space-separate for multiple.
-    --scoring-workers <N>         Number of CPU workers for parallel scoring (default: 1 = serial)
+    --scoring-workers <N>         Number of CPU workers for parallel scoring (default: 0 = auto)
 
 Data options:
     --input <PATH>                Input JSONL path (default: data/processed/vlm_compatible_val.jsonl)
@@ -54,12 +54,15 @@ Data options:
 
 vLLM engine options:
     --tp <N>                      Tensor parallelism (default: 4)
+    --dp <N>                      Data-parallel replicas (default: 1 — prefer for models that fit on 1 GPU)
     --gpu-util <UTIL>             GPU memory utilization (default: 0.92)
     --max-model-len <LEN>         Max model context length (default: 4096)
+    --max-num-seqs <N>            Max concurrent sequences — lower reduces KV cache memory (default: 1024)
     --max-pixels <N>              Max pixels for image resizing (default: 262144 = 512x512)
     --min-pixels <N>              Min pixels for image resizing (default: 65536 = 256x256)
     --chunk-size <N>              Examples per llm.chat() call (default: 256)
     --enforce-eager               Disable CUDA graphs — slower but more uniform latency
+    --base-model                  Use LLM.generate() with raw prompts (for base/pretrained models)
 
 Output:
     Results are saved under logs/schedule/oven_<method>_<prompt>/<model>/<run_id>/
@@ -111,16 +114,19 @@ INF_RESUME=false
 
 # Scoring
 SCORING_MEASURE="exact_match"
-INF_SCORING_WORKERS="1"
+INF_SCORING_WORKERS="0"
 
 # vLLM engine
 INF_TP="4"
+INF_DP="1"
 INF_GPU_UTIL="0.92"
 INF_MAX_MODEL_LEN="4096"
+INF_MAX_NUM_SEQS="1024"
 INF_MAX_PIXELS="262144"
 INF_MIN_PIXELS="65536"
 INF_CHUNK_SIZE="256"
 INF_ENFORCE_EAGER=false
+INF_BASE_MODEL=false
 
 # ---------------------------------------------------------------------------
 # Parse arguments
@@ -157,12 +163,15 @@ main() {
             --max-examples)    INF_MAX_EXAMPLES="$2"; shift 2 ;;
             --resume)          INF_RESUME=true; shift ;;
             --tp)              INF_TP="$2"; shift 2 ;;
+            --dp)              INF_DP="$2"; shift 2 ;;
             --gpu-util)        INF_GPU_UTIL="$2"; shift 2 ;;
             --max-model-len)   INF_MAX_MODEL_LEN="$2"; shift 2 ;;
+            --max-num-seqs)    INF_MAX_NUM_SEQS="$2"; shift 2 ;;
             --max-pixels)      INF_MAX_PIXELS="$2"; shift 2 ;;
             --min-pixels)      INF_MIN_PIXELS="$2"; shift 2 ;;
             --chunk-size)      INF_CHUNK_SIZE="$2"; shift 2 ;;
             --enforce-eager)   INF_ENFORCE_EAGER=true; shift ;;
+            --base-model)      INF_BASE_MODEL=true; shift ;;
             --scoring-measure) SCORING_MEASURE="$2"; shift 2 ;;
             --scoring-workers) INF_SCORING_WORKERS="$2"; shift 2 ;;
             *) echo "Error: unknown option: $1" >&2; exit 1 ;;
@@ -200,6 +209,12 @@ main() {
         ENFORCE_EAGER_FLAG="--enforce-eager"
     fi
 
+    # Build base-model flag
+    BASE_MODEL_FLAG=""
+    if [[ "$INF_BASE_MODEL" == true ]]; then
+        BASE_MODEL_FLAG="--base-model"
+    fi
+
     # Pre-flight: venv must already be built
     if [[ ! -x ".venv/bin/python" ]]; then
         echo "Error: .venv/bin/python not found." >&2
@@ -217,9 +232,10 @@ main() {
     echo "  Temperature:  $INF_TEMPERATURE"
     echo "  Top-p:        $INF_TOP_P"
     echo "  Top-k:        $INF_TOP_K"
-    echo "  GPUs:         $SLURM_GPUS  (TP=$INF_TP)"
+    echo "  GPUs:         $SLURM_GPUS  (TP=$INF_TP, DP=$INF_DP)"
     echo "  Max pixels:   $INF_MAX_PIXELS"
-    echo "  Score with:   $SCORING_MEASURE  (workers=$INF_SCORING_WORKERS)"
+    echo "  Base model:   $INF_BASE_MODEL"
+    echo "  Score with:   $SCORING_MEASURE  (workers=${INF_SCORING_WORKERS:-0})"
     echo ""
 
     # Submit
@@ -256,6 +272,7 @@ module load gcc/12.2.0
 
 export CC=gcc
 export CXX=g++
+export OMP_NUM_THREADS=1
 
 # -----------------------------------------------------------------------
 # Load cluster-specific environment (HF_HOME, offline mode, etc.)
@@ -303,12 +320,15 @@ python -m scripts.run_inference \\
     --top-k "$INF_TOP_K" \\
     --max-tokens "$INF_MAX_TOKENS" \\
     --tp "$INF_TP" \\
+    --dp "$INF_DP" \\
     --gpu-util "$INF_GPU_UTIL" \\
     --max-model-len "$INF_MAX_MODEL_LEN" \\
+    --max-num-seqs "$INF_MAX_NUM_SEQS" \\
     --max-pixels "$INF_MAX_PIXELS" \\
     --min-pixels "$INF_MIN_PIXELS" \\
     --chunk-size "$INF_CHUNK_SIZE" \\
     $ENFORCE_EAGER_FLAG \\
+    $BASE_MODEL_FLAG \\
     \$([ "$INF_METHOD" = "naive-sampling" ] && echo "--samples-per-example $INF_SAMPLES_PER_EXAMPLE") \\
     \$([ "$INF_METHOD" = "iterative" ] && echo "--attempts-per-round $INF_ATTEMPTS_PER_ROUND --max-rounds $INF_MAX_ROUNDS --enable-feedback $INF_FEEDBACK --max-feedback-chars $INF_MAX_FEEDBACK_CHARS") \\
     $MAX_EXAMPLES_FLAG \\

@@ -143,15 +143,13 @@ def _load_pil(path: str) -> Image.Image | None:
 
 
 # ---------------------------------------------------------------------------
-# Conversation builder
+# Prompt builders
 # ---------------------------------------------------------------------------
 
 def _make_conversation(example: dict, image: Image.Image | None, prompt_variant: str) -> list[dict]:
-    """Build a single-turn conversation for ``LLM.chat()``.
+    """Build a single-turn conversation for ``LLM.chat()`` (instruct models).
 
     PIL images are passed directly — no base64 encoding needed.
-    OVEN is a visual entity recognition task — the question is always
-    "what is this?" — so we use a fixed question string.
     """
     question = example.get("question")
     if question is None:
@@ -165,6 +163,24 @@ def _make_conversation(example: dict, image: Image.Image | None, prompt_variant:
         content.append({"type": "image", "image": image})
     content.append({"type": "text", "text": prompt_text})
     return [{"role": "user", "content": content}]
+
+
+def _make_raw_prompt(example: dict, image: Image.Image | None, prompt_variant: str) -> dict:
+    """Build a raw prompt dict for ``LLM.generate()`` (base/pretrained models).
+
+    Returns a dict with ``prompt`` and ``multi_modal_data`` keys that vLLM's
+    processor handles directly — no chat template required.
+    """
+    question = example.get("question")
+    if question is None:
+        raise KeyError(
+            f"Example missing 'question' field. Available keys: {sorted(example.keys())}. "
+            f"Re-run prepare_oven.py with the correct raw data that includes 'question'."
+        )
+    result: dict = {"prompt": get_prompt(question, prompt_variant)}
+    if image is not None:
+        result["multi_modal_data"] = {"image": image}
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -280,7 +296,7 @@ def _write_iterative_result(state, example, prompt_variant, sampling_kwargs,
         "prediction": prediction,
         "method": "iterative",
         "prompt_variant": prompt_variant,
-        "sampling": f"temp={sampling_kwargs['temperature']}, top_p={sampling_kwargs['top_p']}, n={attempts_per_round}",
+        "sampling": f"temp={sampling_kwargs['temperature']}, top_p={sampling_kwargs['top_p']}, top_k={sampling_kwargs.get('top_k', -1)}, n={attempts_per_round}",
         "attempts_per_round": attempts_per_round,
         "max_rounds": max_rounds,
         "enable_feedback": enable_feedback,
@@ -300,6 +316,8 @@ def main():
 
     # Data I/O
     parser.add_argument("--input", required=True, help="Input JSONL (prepared OVEN data)")
+    parser.add_argument("--taxonomy-index", default="data/processed/oven_taxonomy_index.json",
+                        help="Path to taxonomy index JSON")
     parser.add_argument("--output-dir", default=None,
                         help="Output directory (default: auto-generated from model/method/prompt)")
     parser.add_argument("--output-root", default="logs/schedule",
@@ -332,6 +350,9 @@ def main():
 
     # vLLM engine
     parser.add_argument("--tp", type=int, default=1, help="Tensor parallelism (default: 1)")
+    parser.add_argument("--dp", type=int, default=1,
+                        help="Data-parallel replicas. For models that fit on one GPU, "
+                             "prefer DP over TP (default: 1)")
     parser.add_argument("--gpu-util", type=float, default=0.92, help="GPU memory utilization (default: 0.92)")
     parser.add_argument("--max-model-len", type=int, default=1024, help="Max model context length (default: 1024)")
     parser.add_argument("--max-num-seqs", type=int, default=1024, help="Max number of sequences (default: 1024)")
@@ -341,6 +362,9 @@ def main():
                         help="Min pixels for image resizing (default: 65536 = 256x256)")
     parser.add_argument("--enforce-eager", action="store_true",
                         help="Disable CUDA graphs — slower but more uniform step latency")
+    parser.add_argument("--base-model", action="store_true",
+                        help="Use LLM.generate() with raw prompts (for base/pretrained models "
+                             "that lack a chat template)")
 
     # Chunking — write results to disk after every chunk, so a crash at 99%
     # only loses one chunk.  The LLM engine is reused across chunks.
@@ -402,28 +426,44 @@ def main():
     with ThreadPoolExecutor(max_workers=16) as pool:
         images = list(pool.map(lambda e: _load_pil(e.get("image_path", "")), examples))
 
-    # Build conversations
-    conversations = [
-        _make_conversation(ex, img, args.prompt_variant)
-        for ex, img in zip(examples, images)
-    ]
+    # Build prompts (conversations for instruct, raw dicts for base)
+    if args.base_model:
+        raw_prompts = [
+            _make_raw_prompt(ex, img, args.prompt_variant)
+            for ex, img in zip(examples, images)
+        ]
+    else:
+        conversations = [
+            _make_conversation(ex, img, args.prompt_variant)
+            for ex, img in zip(examples, images)
+        ]
 
     # Build vLLM engine
     print(f"Initializing vLLM engine: model={args.model} tp={args.tp} max_model_len={args.max_model_len}")
+
+    # Per-model-family kwargs — avoids passing processor-specific args to the
+    # wrong model (e.g. Qwen's max_pixels/min_pixels would error on InternVL).
+    extra_llm_kwargs: dict = {}
+    if "qwen" in args.model.lower():
+        extra_llm_kwargs["mm_processor_kwargs"] = {
+            "max_pixels": args.max_pixels,
+            "min_pixels": args.min_pixels,
+        }
+
     llm = LLM(
         model=args.model,
         tensor_parallel_size=args.tp,
+        data_parallel_size=args.dp,
         gpu_memory_utilization=args.gpu_util,
         max_model_len=args.max_model_len,
         max_num_seqs=args.max_num_seqs,
         enable_prefix_caching=True,
         enforce_eager=args.enforce_eager,
         limit_mm_per_prompt={"image": 1},
-        mm_processor_kwargs={
-            "max_pixels": args.max_pixels,
-            "min_pixels": args.min_pixels,
-        },
+        mm_processor_cache_gb=0,
+        async_scheduling=True,
         trust_remote_code=True,
+        **extra_llm_kwargs,
     )
 
     print(f"Running {args.method} inference on {len(examples)} examples")
@@ -431,10 +471,59 @@ def main():
     print(f"  Prompt:    {args.prompt_variant}")
     print(f"  Sampling:  temp={args.temperature}, top_p={args.top_p}, n={n}")
     print(f"  Max tok:   {args.max_tokens}")
-    print(f"  Chunk:     {args.chunk_size} examples per llm.chat() call")
+    print(f"  Chunk:     {args.chunk_size} examples per {'llm.generate()' if args.base_model else 'llm.chat()'} call")
     print(f"  Output:    {output_dir}")
 
+    # ── Write run metadata ──────────────────────────────────────────
+    metadata = {
+        "model": args.model,
+        "method": args.method,
+        "prompt_variant": args.prompt_variant,
+        "base_model": args.base_model,
+        "sampling": {
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+            "top_k": args.top_k,
+            "max_tokens": args.max_tokens,
+            "n": n,
+        },
+        "vllm": {
+            "tensor_parallel_size": args.tp,
+            "data_parallel_size": args.dp,
+            "gpu_memory_utilization": args.gpu_util,
+            "max_model_len": args.max_model_len,
+            "max_num_seqs": args.max_num_seqs,
+            "max_pixels": args.max_pixels,
+            "min_pixels": args.min_pixels,
+            "enforce_eager": args.enforce_eager,
+        },
+        "data": {
+            "input": args.input,
+            "taxonomy_index": args.taxonomy_index,
+            "max_examples": args.max_examples,
+            "chunk_size": args.chunk_size,
+            "resume": args.resume,
+            "num_examples": len(examples),
+        },
+    }
+    if args.method == "naive-sampling":
+        metadata["naive_sampling"] = {"samples_per_example": args.samples_per_example}
+    elif args.method == "iterative":
+        metadata["iterative"] = {
+            "attempts_per_round": args.attempts_per_round,
+            "max_rounds": args.max_rounds,
+            "enable_feedback": args.enable_feedback,
+            "max_feedback_chars": args.max_feedback_chars,
+        }
+
+    with open(output_dir / f"{run_id}_metadata.json", "w") as mf:
+        json.dump(metadata, mf, indent=2, ensure_ascii=False)
+    # ────────────────────────────────────────────────────────────────
+
     if args.method == "iterative":
+        if args.base_model:
+            parser.error("--base-model is incompatible with --method iterative "
+                         "(iterative requires chat-template-based conversation history)")
         # Iterative: chunk *outside* the round loop so each chunk runs
         # all its rounds and writes before moving on.
         n_chunks = (len(examples) + args.chunk_size - 1) // args.chunk_size
@@ -457,11 +546,17 @@ def main():
             s = ci * args.chunk_size
             e = min(s + args.chunk_size, len(examples))
             chunk_exs = examples[s:e]
-            chunk_imgs = images[s:e]
-            chunk_convs = conversations[s:e]
 
-            print(f"[chunk {ci + 1}/{n_chunks}] {len(chunk_exs)} examples × n={n}")
-            outputs = llm.chat(chunk_convs, sampling_params, use_tqdm=True)
+            n_ex = len(chunk_exs)
+            api_label = "llm.generate()" if args.base_model else "llm.chat()"
+            print(f"[chunk {ci + 1}/{n_chunks}] {n_ex} examples × n={n} [{api_label}]")
+
+            if args.base_model:
+                chunk_prompts = raw_prompts[s:e]
+                outputs = llm.generate(chunk_prompts, sampling_params, use_tqdm=True)
+            else:
+                chunk_convs = conversations[s:e]
+                outputs = llm.chat(chunk_convs, sampling_params, use_tqdm=True)
 
             for example, request_output in zip(chunk_exs, outputs):
                 all_texts = [co.text for co in request_output.outputs]
@@ -481,7 +576,7 @@ def main():
                         "prediction": prediction,
                         "method": "naive-sampling",
                         "prompt_variant": args.prompt_variant,
-                        "sampling": f"temp={args.temperature}, top_p={args.top_p}, n={n}",
+                        "sampling": f"temp={args.temperature}, top_p={args.top_p}, top_k={args.top_k}, n={n}",
                         "n_samples": n,
                         "success": success,
                         "all_texts": all_texts,
@@ -493,7 +588,7 @@ def main():
                         "prediction": prediction,
                         "method": "naive",
                         "prompt_variant": args.prompt_variant,
-                        "sampling": f"temp={args.temperature}, top_p={args.top_p}, n={n}",
+                        "sampling": f"temp={args.temperature}, top_p={args.top_p}, top_k={args.top_k}, n={n}",
                     }
 
                 append_jsonl(output_path, result)

@@ -19,7 +19,9 @@ The ``{}`` placeholder is replaced with the OVEN question text.
 # ---------------------------------------------------------------------------
 
 PROMPT_VARIANTS = {
+    "base_pretrained": "Q: {}\nA:",
     "barebones": "{} Answer in the format 'A: <answer>.'",
+    "concise": "{} Answer questions directly and concisely. If you don't know, say 'I don't know'.",
     "default": (
         "{} Do not give any extra text. Do not answer in a full sentence. "
         "Do not specify your certainty about the answer. Give your best guess "
@@ -60,49 +62,3 @@ def get_prompt(question: str, variant: str = "barebones") -> str:
             f"Available: {list(PROMPT_VARIANTS.keys())}"
         )
     return template.format(question)
-
-
-def build_messages(
-    question: str,
-    variant: str = "barebones",
-    feedback: Optional[str] = None,
-) -> list[dict]:
-    """Build a chat-style message list for the vLLM API.
-
-    Parameters
-    ----------
-    question : str
-        The OVEN question.
-    variant : str
-        Prompt variant name.
-    feedback : str, optional
-        If given, appended as a follow-up user message (for iterative resampling).
-
-    Returns
-    -------
-    list[dict]
-        Messages in OpenAI chat format:
-        [{"role": "user", "content": [{"type": "text", ...}, {"type": "image_url", ...}]}]
-        The image placeholder is added by the caller (run_inference.py) since
-        we need the actual file path or base64 data.
-    """
-    prompt_text = get_prompt(question, variant)
-
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt_text},
-                # image_url entry added by the caller
-            ],
-        }
-    ]
-
-    if feedback:
-        messages.append({"role": "assistant", "content": ""})  # placeholder
-        messages.append({
-            "role": "user",
-            "content": [{"type": "text", "text": feedback}],
-        })
-
-    return messages
