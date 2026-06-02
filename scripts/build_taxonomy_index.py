@@ -37,7 +37,14 @@ def main():
     print(f"  Tree: {tree.number_of_nodes()} nodes, {tree.number_of_edges()} edges")
     print(f"  Paths: {len(split)}")
 
-    # Build node → path (root-to-leaf)
+    # Build node → path (leaf-to-root, "root" appended).
+    #
+    # vlm-eval's DirectMeasureMatcher reverses shortest_path results so the
+    # path starts at the leaf and ends at "root".  calc_hierarchical_metrics()
+    # builds ancestor sets by taking suffixes from the END of the path — with
+    # leaf-to-root ordering the suffixes are root-anchored, so two entities
+    # that share an ancestor (e.g. both are bridges) get partial credit even
+    # when their leaf nodes differ.
     import networkx as nx
 
     node_to_path = {}
@@ -46,8 +53,8 @@ def main():
             continue
         try:
             path = nx.shortest_path(tree, "root", node)
-            # Skip the synthetic "root" node in the path
-            path = path[1:]
+            # shortest_path → root..leaf; reverse to leaf..root, keep "root"
+            path = list(reversed(path))
         except nx.NetworkXNoPath:
             continue
         node_to_path[node] = path
@@ -84,7 +91,8 @@ def main():
                     break
 
         if ancestry:
-            entity_id_to_path[eid] = ancestry
+            # leaf-to-root with "root" appended (matching vlm-eval convention)
+            entity_id_to_path[eid] = list(reversed(ancestry)) + ["root"]
 
     # Collect all node labels (original casing)
     all_nodes = sorted(node_to_path.keys())
