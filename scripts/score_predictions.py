@@ -46,9 +46,9 @@ def main():
                         help="Measure(s) from ALL_MEASURES, space-separated. "
                              "Use 'all' for every registered measure. "
                              "(default: exact_match)")
-    parser.add_argument("--num-workers", type=int, default=1,
+    parser.add_argument("--num-workers", type=int, default=0,
                         help="Number of worker processes for parallel scoring. "
-                             "Default 1 (serial). "
+                             "0 = auto (all available CPUs via sched_getaffinity). "
                              "Each worker loads its own copy of the taxonomy index.")
     args = parser.parse_args()
 
@@ -62,8 +62,14 @@ def main():
     )
 
     print("Summary:")
-    for k, v in summary.items():
-        print(f"  {k}: {v}")
+    if isinstance(summary, list):
+        for entry in summary:
+            print(f"  [{entry['measure']}]")
+            for k, v in entry["metrics"].items():
+                print(f"    {k}: {v}")
+    else:
+        for k, v in summary.items():
+            print(f"  {k}: {v}")
 
 
 if __name__ == "__main__":

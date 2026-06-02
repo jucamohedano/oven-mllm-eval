@@ -98,9 +98,6 @@ class DirectMeasureMatcher:
         self.measure = measure
         self.top_k = top_k
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
 
     def match(self, prediction: str) -> dict | None:
         """Score prediction against all taxonomy nodes, return best match.
@@ -141,6 +138,13 @@ class DirectMeasureMatcher:
         best_node = self.all_nodes[best_idx]
         best_path = self.node_to_path.get(best_node)
         best_score = float(all_scores[best_idx])
+
+        # When every node scores 0, np.argsort on all-zeros returns indices
+        # in original order — the "best" would be the last alphabetically
+        # sorted node (Unicode tail: Japanese, Cyrillic).  There is no
+        # meaningful match in that case.
+        if best_score == 0.0:
+            return None
 
         top_k_candidates = []
         for idx in top_k_idxs:
