@@ -350,9 +350,6 @@ def main():
 
     # vLLM engine
     parser.add_argument("--tp", type=int, default=1, help="Tensor parallelism (default: 1)")
-    parser.add_argument("--dp", type=int, default=1,
-                        help="Data-parallel replicas. For models that fit on one GPU, "
-                             "prefer DP over TP (default: 1)")
     parser.add_argument("--gpu-util", type=float, default=0.92, help="GPU memory utilization (default: 0.92)")
     parser.add_argument("--max-model-len", type=int, default=1024, help="Max model context length (default: 1024)")
     parser.add_argument("--max-num-seqs", type=int, default=1024, help="Max number of sequences (default: 1024)")
@@ -375,6 +372,10 @@ def main():
     # limits
     parser.add_argument("--max-examples", type=int, default=None, help="Limit number of examples")
     parser.add_argument("--resume", action="store_true", help="Skip already-completed examples in output")
+    # External data-parallel sharding: one process per GPU, each takes a stride.
+    parser.add_argument("--shard", type=int, default=0, help="This process's shard index (0-based)")
+    parser.add_argument("--num-shards", type=int, default=1,
+                        help="Total shards. Each process handles examples[shard::num_shards]")
     args = parser.parse_args()
 
     # Validate sampling params
@@ -402,6 +403,13 @@ def main():
     if args.max_examples:
         examples = examples[:args.max_examples]
 
+    # Strided sharding — balances load even if the file is ordered by category/size.
+    if args.num_shards > 1:
+        if not (0 <= args.shard < args.num_shards):
+            parser.error(f"--shard must be in [0, {args.num_shards}), got {args.shard}")
+        examples = examples[args.shard::args.num_shards]
+        print(f"Shard {args.shard}/{args.num_shards}: {len(examples)} examples")
+
     # Build output directory
     if args.output_dir:
         output_dir = Path(args.output_dir)
@@ -409,7 +417,8 @@ def main():
     else:
         output_dir, run_id = build_output_dir(args.model, args.method, args.prompt_variant, args.output_root)
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / f"{run_id}_samples.jsonl"
+    suffix = f"_shard{args.shard}" if args.num_shards > 1 else ""
+    output_path = output_dir / f"{run_id}_samples{suffix}.jsonl"
 
     # Resume support — filter before loading images
     if args.resume and output_path.exists():
@@ -453,7 +462,6 @@ def main():
     llm = LLM(
         model=args.model,
         tensor_parallel_size=args.tp,
-        data_parallel_size=args.dp,
         gpu_memory_utilization=args.gpu_util,
         max_model_len=args.max_model_len,
         max_num_seqs=args.max_num_seqs,
@@ -489,7 +497,6 @@ def main():
         },
         "vllm": {
             "tensor_parallel_size": args.tp,
-            "data_parallel_size": args.dp,
             "gpu_memory_utilization": args.gpu_util,
             "max_model_len": args.max_model_len,
             "max_num_seqs": args.max_num_seqs,
@@ -506,6 +513,8 @@ def main():
             "num_examples": len(examples),
         },
     }
+    if args.num_shards > 1:
+        metadata["sharding"] = {"shard": args.shard, "num_shards": args.num_shards}
     if args.method == "naive-sampling":
         metadata["naive_sampling"] = {"samples_per_example": args.samples_per_example}
     elif args.method == "iterative":

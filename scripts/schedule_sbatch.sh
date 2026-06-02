@@ -112,6 +112,9 @@ INF_TAXONOMY_INDEX="data/processed/oven_taxonomy_index.json"
 INF_MAX_EXAMPLES=""
 INF_RESUME=false
 
+# Output
+INF_OUTPUT_DIR=""
+
 # Scoring
 SCORING_MEASURE="exact_match"
 INF_SCORING_WORKERS="0"
@@ -162,6 +165,7 @@ main() {
             --taxonomy-index)  INF_TAXONOMY_INDEX="$2"; shift 2 ;;
             --max-examples)    INF_MAX_EXAMPLES="$2"; shift 2 ;;
             --resume)          INF_RESUME=true; shift ;;
+            --output-dir)      INF_OUTPUT_DIR="$2"; shift 2 ;;
             --tp)              INF_TP="$2"; shift 2 ;;
             --dp)              INF_DP="$2"; shift 2 ;;
             --gpu-util)        INF_GPU_UTIL="$2"; shift 2 ;;
@@ -213,6 +217,12 @@ main() {
     BASE_MODEL_FLAG=""
     if [[ "$INF_BASE_MODEL" == true ]]; then
         BASE_MODEL_FLAG="--base-model"
+    fi
+
+    # Build output-dir flag
+    OUTPUT_DIR_FLAG=""
+    if [[ -n "$INF_OUTPUT_DIR" ]]; then
+        OUTPUT_DIR_FLAG="--output-dir $INF_OUTPUT_DIR"
     fi
 
     # Pre-flight: venv must already be built
@@ -308,57 +318,118 @@ fi
 # -----------------------------------------------------------------------
 # Run inference
 # -----------------------------------------------------------------------
-echo "[info] Running inference: method=$INF_METHOD prompt=$INF_PROMPT temp=$INF_TEMPERATURE"
+echo "[info] Running inference (DP=$INF_DP): method=$INF_METHOD prompt=$INF_PROMPT temp=$INF_TEMPERATURE"
 
-python -m scripts.run_inference \\
-    --input "$INF_INPUT" \\
-    --model "$INF_MODEL" \\
-    --prompt-variant "$INF_PROMPT" \\
-    --method "$INF_METHOD" \\
-    --temperature "$INF_TEMPERATURE" \\
-    --top-p "$INF_TOP_P" \\
-    --top-k "$INF_TOP_K" \\
-    --max-tokens "$INF_MAX_TOKENS" \\
-    --tp "$INF_TP" \\
-    --dp "$INF_DP" \\
-    --gpu-util "$INF_GPU_UTIL" \\
-    --max-model-len "$INF_MAX_MODEL_LEN" \\
-    --max-num-seqs "$INF_MAX_NUM_SEQS" \\
-    --max-pixels "$INF_MAX_PIXELS" \\
-    --min-pixels "$INF_MIN_PIXELS" \\
-    --chunk-size "$INF_CHUNK_SIZE" \\
-    $ENFORCE_EAGER_FLAG \\
-    $BASE_MODEL_FLAG \\
-    \$([ "$INF_METHOD" = "naive-sampling" ] && echo "--samples-per-example $INF_SAMPLES_PER_EXAMPLE") \\
-    \$([ "$INF_METHOD" = "iterative" ] && echo "--attempts-per-round $INF_ATTEMPTS_PER_ROUND --max-rounds $INF_MAX_ROUNDS --enable-feedback $INF_FEEDBACK --max-feedback-chars $INF_MAX_FEEDBACK_CHARS") \\
-    $MAX_EXAMPLES_FLAG \\
-    $RESUME_FLAG
-
-# -----------------------------------------------------------------------
-# Score results — find the latest run directory and score samples
-# -----------------------------------------------------------------------
 MODEL_SLUG=\$(echo "$INF_MODEL" | tr '/' '_' | tr '[:upper:]' '[:lower:]')
-EXPERIMENT_DIR="logs/schedule/oven_${INF_METHOD}_${INF_PROMPT}/\${MODEL_SLUG}"
-OUTPUT_DIR=\$(ls -1d "\${EXPERIMENT_DIR}"/20* 2>/dev/null | sort | tail -1)
 
-if [[ -z "\${OUTPUT_DIR}" ]]; then
-    echo "[error] No output directory found under \${EXPERIMENT_DIR}" >&2
-else
-    SAMPLES=\$(ls -1 "\${OUTPUT_DIR}"/*_samples.jsonl 2>/dev/null | head -1)
-    if [[ -z "\${SAMPLES}" ]]; then
-        echo "[error] No *_samples.jsonl found in \${OUTPUT_DIR}" >&2
-    else
-        echo "[info] Scoring \${SAMPLES}..."
-        RUN_ID=\$(basename "\${SAMPLES}" _samples.jsonl)
-        SCORED_OUT="\${OUTPUT_DIR}/\${RUN_ID}_scored.jsonl"
-        python -m scripts.score_predictions \\
-            --input "\${SAMPLES}" \\
-            --output "\${SCORED_OUT}" \\
-            --taxonomy-index "$INF_TAXONOMY_INDEX" \\
-            --measure $SCORING_MEASURE \\
-            --num-workers $INF_SCORING_WORKERS
+if [[ "$INF_DP" -gt 1 ]]; then
+    # ── Multi-process data-parallel ──────────────────────────────────
+    # One independent single-GPU process per shard.  Each process slices
+    # the dataset via strided sharding and writes its own samples file.
+    # We merge them afterwards into the canonical samples file.
+
+    RUN_ID="\$(date +%Y%m%d_%H%M%S)_\$(printf '%06d' \$((RANDOM * RANDOM % 1000000)))"
+    OUTPUT_DIR="logs/schedule/oven_${INF_METHOD}_${INF_PROMPT}/\${MODEL_SLUG}/\${RUN_ID}"
+    mkdir -p "\${OUTPUT_DIR}"
+    echo "[info] Output dir: \${OUTPUT_DIR}"
+
+    # Index into whatever GPUs SLURM actually gave us
+    IFS=',' read -ra ALLOC_GPUS <<< "\${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+
+    pids=()
+    for i in \$(seq 0 \$(($INF_DP - 1))); do
+        gpu="\${ALLOC_GPUS[\$i]}"
+        echo "[info] launching shard \$i on GPU \${gpu}"
+        CUDA_VISIBLE_DEVICES="\${gpu}" python -m scripts.run_inference \\
+            --input "$INF_INPUT" \\
+            --model "$INF_MODEL" \\
+            --prompt-variant "$INF_PROMPT" \\
+            --method "$INF_METHOD" \\
+            --output-dir "\${OUTPUT_DIR}" \\
+            --shard \$i --num-shards $INF_DP \\
+            --temperature "$INF_TEMPERATURE" \\
+            --top-p "$INF_TOP_P" \\
+            --top-k "$INF_TOP_K" \\
+            --max-tokens "$INF_MAX_TOKENS" \\
+            --tp 1 \\
+            --gpu-util "$INF_GPU_UTIL" \\
+            --max-model-len "$INF_MAX_MODEL_LEN" \\
+            --max-num-seqs "$INF_MAX_NUM_SEQS" \\
+            --max-pixels "$INF_MAX_PIXELS" \\
+            --min-pixels "$INF_MIN_PIXELS" \\
+            --chunk-size "$INF_CHUNK_SIZE" \\
+            $ENFORCE_EAGER_FLAG \\
+            $BASE_MODEL_FLAG \\
+            \$([ "$INF_METHOD" = "naive-sampling" ] && echo "--samples-per-example $INF_SAMPLES_PER_EXAMPLE") \\
+            \$([ "$INF_METHOD" = "iterative" ] && echo "--attempts-per-round $INF_ATTEMPTS_PER_ROUND --max-rounds $INF_MAX_ROUNDS --enable-feedback $INF_FEEDBACK --max-feedback-chars $INF_MAX_FEEDBACK_CHARS") \\
+            $MAX_EXAMPLES_FLAG \\
+            $RESUME_FLAG \\
+            > "\${OUTPUT_DIR}/shard\${i}.log" 2>&1 &
+        pids+=(\$!)
+    done
+
+    # Wait for all shards; fail loudly if any shard dies
+    fail=0
+    for pid in "\${pids[@]}"; do
+        wait "\$pid" || fail=1
+    done
+    if [[ \$fail -ne 0 ]]; then
+        echo "[error] a shard failed — see \${OUTPUT_DIR}/shard*.log" >&2
+        tail -n 30 "\${OUTPUT_DIR}"/shard*.log >&2 || true
+        exit 1
     fi
+
+    # Merge shard outputs into the canonical samples file
+    SAMPLES="\${OUTPUT_DIR}/\${RUN_ID}_samples.jsonl"
+    cat "\${OUTPUT_DIR}/\${RUN_ID}_samples_shard"*.jsonl > "\${SAMPLES}"
+    echo "[info] Merged \$(wc -l < "\${SAMPLES}") samples into \${SAMPLES}"
+else
+    # ── Single-process path (honours --tp for large models) ─────────
+    python -m scripts.run_inference \\
+        --input "$INF_INPUT" \\
+        --model "$INF_MODEL" \\
+        --prompt-variant "$INF_PROMPT" \\
+        --method "$INF_METHOD" \\
+        --temperature "$INF_TEMPERATURE" \\
+        --top-p "$INF_TOP_P" \\
+        --top-k "$INF_TOP_K" \\
+        --max-tokens "$INF_MAX_TOKENS" \\
+        --tp "$INF_TP" \\
+        --gpu-util "$INF_GPU_UTIL" \\
+        --max-model-len "$INF_MAX_MODEL_LEN" \\
+        --max-num-seqs "$INF_MAX_NUM_SEQS" \\
+        --max-pixels "$INF_MAX_PIXELS" \\
+        --min-pixels "$INF_MIN_PIXELS" \\
+        --chunk-size "$INF_CHUNK_SIZE" \\
+        $ENFORCE_EAGER_FLAG \\
+        $BASE_MODEL_FLAG \\
+        $OUTPUT_DIR_FLAG \\
+        \$([ "$INF_METHOD" = "naive-sampling" ] && echo "--samples-per-example $INF_SAMPLES_PER_EXAMPLE") \\
+        \$([ "$INF_METHOD" = "iterative" ] && echo "--attempts-per-round $INF_ATTEMPTS_PER_ROUND --max-rounds $INF_MAX_ROUNDS --enable-feedback $INF_FEEDBACK --max-feedback-chars $INF_MAX_FEEDBACK_CHARS") \\
+        $MAX_EXAMPLES_FLAG \\
+        $RESUME_FLAG
+
+    EXPERIMENT_DIR="logs/schedule/oven_${INF_METHOD}_${INF_PROMPT}/\${MODEL_SLUG}"
+    OUTPUT_DIR=\$(ls -1d "\${EXPERIMENT_DIR}"/20* 2>/dev/null | sort | tail -1)
+    SAMPLES=\$(ls -1 "\${OUTPUT_DIR}"/*_samples.jsonl 2>/dev/null | head -1)
 fi
+
+# -----------------------------------------------------------------------
+# Score
+# -----------------------------------------------------------------------
+if [[ -z "\${SAMPLES:-}" || ! -s "\${SAMPLES}" ]]; then
+    echo "[error] No samples to score" >&2
+    exit 1
+fi
+echo "[info] Scoring \${SAMPLES}..."
+RUN_ID=\$(basename "\${SAMPLES}" _samples.jsonl)
+SCORED_OUT="\${OUTPUT_DIR}/\${RUN_ID}_scored.jsonl"
+python -m scripts.score_predictions \\
+    --input "\${SAMPLES}" \\
+    --output "\${SCORED_OUT}" \\
+    --taxonomy-index "$INF_TAXONOMY_INDEX" \\
+    --measure $SCORING_MEASURE \\
+    --num-workers $INF_SCORING_WORKERS
 
 echo "[info] Done."
 EOT
