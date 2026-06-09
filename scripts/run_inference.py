@@ -132,11 +132,20 @@ def _build_feedback(round_idx: int, failed_texts: list[str], max_chars: int = 20
 # Image loading
 # ---------------------------------------------------------------------------
 
-def _load_pil(path: str) -> Image.Image | None:
-    """Load an image as RGB PIL, returning None if the file doesn't exist."""
-    if not path or not Path(path).exists():
-        return None
-    img = Image.open(path)
+def _load_pil(path: str) -> Image.Image:
+    """Load an image as RGB PIL, raising on missing or unreadable files."""
+    if not path:
+        raise ValueError("Empty image_path in example")
+    p = Path(path)
+    if not p.exists():
+        for ext in (".JPEG", ".jpeg", ".JPG"):
+            alt = p.with_suffix(ext)
+            if alt.exists():
+                p = alt
+                break
+        else:
+            raise FileNotFoundError(f"Image not found: {p.resolve()} (cwd={Path.cwd()})")
+    img = Image.open(p)
     if img.mode not in ("RGB", "L"):
         img = img.convert("RGB")
     return img
@@ -160,7 +169,7 @@ def _make_conversation(example: dict, image: Image.Image | None, prompt_variant:
     prompt_text = get_prompt(question, prompt_variant)
     content = []
     if image is not None:
-        content.append({"type": "image", "image": image})
+        content.append({"type": "image_pil", "image_pil": image})
     content.append({"type": "text", "text": prompt_text})
     return [{"role": "user", "content": content}]
 
@@ -214,7 +223,7 @@ def run_iterative(
         prompt_text = get_prompt(ex.get("question") or _raise_missing_question(ex), prompt_variant)
         content = []
         if img is not None:
-            content.append({"type": "image", "image": img})
+            content.append({"type": "image_pil", "image_pil": img})
         content.append({"type": "text", "text": prompt_text})
         states.append({
             "idx": i,
@@ -317,6 +326,9 @@ def main():
 
     # Data I/O
     parser.add_argument("--input", required=True, help="Input JSONL (prepared OVEN data)")
+    parser.add_argument("--image-root", default=None,
+                        help="Root directory for resolving relative image_path. "
+                             "Defaults to cwd.")
     parser.add_argument("--taxonomy-index", default="data/processed/oven_taxonomy_index.json",
                         help="Path to taxonomy index JSON")
     parser.add_argument("--output-dir", default=None,
@@ -434,10 +446,16 @@ def main():
         examples = [e for e in examples if e.get("data_id", e.get("image_id", "")) not in done_ids]
         print(f"Resuming: {len(done_ids)} already done, {len(examples)} remaining")
 
-    # Load images in parallel
-    print("Loading images...")
+    # Resolve image paths — relative paths break when cwd != project root
+    # (SLURM, DP shard processes).  Defaults to cwd; use --image-root to override.
+    image_root = Path(args.image_root) if args.image_root else Path.cwd()
+    print(f"Loading images... (root: {image_root})")
     with ThreadPoolExecutor(max_workers=16) as pool:
-        images = list(pool.map(lambda e: _load_pil(e.get("image_path", "")), examples))
+        resolved = [
+            str(image_root / p) if not Path(p).is_absolute() else p
+            for p in [e.get("image_path", "") for e in examples]
+        ]
+        images = list(pool.map(_load_pil, resolved))
 
     # Build prompts (conversations for instruct, raw dicts for base)
     if args.base_model:

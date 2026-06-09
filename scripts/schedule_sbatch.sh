@@ -114,6 +114,7 @@ INF_RESUME=false
 
 # Output
 INF_OUTPUT_DIR=""
+INF_IMAGE_ROOT=""
 
 # Scoring
 SCORING_MEASURE="exact_match"
@@ -166,6 +167,7 @@ main() {
             --max-examples)    INF_MAX_EXAMPLES="$2"; shift 2 ;;
             --resume)          INF_RESUME=true; shift ;;
             --output-dir)      INF_OUTPUT_DIR="$2"; shift 2 ;;
+            --image-root)      INF_IMAGE_ROOT="$2"; shift 2 ;;
             --tp)              INF_TP="$2"; shift 2 ;;
             --dp)              INF_DP="$2"; shift 2 ;;
             --gpu-util)        INF_GPU_UTIL="$2"; shift 2 ;;
@@ -223,6 +225,12 @@ main() {
     OUTPUT_DIR_FLAG=""
     if [[ -n "$INF_OUTPUT_DIR" ]]; then
         OUTPUT_DIR_FLAG="--output-dir $INF_OUTPUT_DIR"
+    fi
+
+    # Build image-root flag
+    IMAGE_ROOT_FLAG=""
+    if [[ -n "$INF_IMAGE_ROOT" ]]; then
+        IMAGE_ROOT_FLAG="--image-root $INF_IMAGE_ROOT"
     fi
 
     # Pre-flight: venv must already be built
@@ -358,6 +366,7 @@ if [[ "$INF_DP" -gt 1 ]]; then
             --chunk-size "$INF_CHUNK_SIZE" \\
             $ENFORCE_EAGER_FLAG \\
             $BASE_MODEL_FLAG \\
+            $IMAGE_ROOT_FLAG \\
             \$([ "$INF_METHOD" = "naive-sampling" ] && echo "--samples-per-example $INF_SAMPLES_PER_EXAMPLE") \\
             \$([ "$INF_METHOD" = "iterative" ] && echo "--attempts-per-round $INF_ATTEMPTS_PER_ROUND --max-rounds $INF_MAX_ROUNDS --enable-feedback $INF_FEEDBACK --max-feedback-chars $INF_MAX_FEEDBACK_CHARS") \\
             $MAX_EXAMPLES_FLAG \\
@@ -415,6 +424,7 @@ else
         --chunk-size "$INF_CHUNK_SIZE" \\
         $ENFORCE_EAGER_FLAG \\
         $BASE_MODEL_FLAG \\
+        $IMAGE_ROOT_FLAG \\
         $OUTPUT_DIR_FLAG \\
         \$([ "$INF_METHOD" = "naive-sampling" ] && echo "--samples-per-example $INF_SAMPLES_PER_EXAMPLE") \\
         \$([ "$INF_METHOD" = "iterative" ] && echo "--attempts-per-round $INF_ATTEMPTS_PER_ROUND --max-rounds $INF_MAX_ROUNDS --enable-feedback $INF_FEEDBACK --max-feedback-chars $INF_MAX_FEEDBACK_CHARS") \\
