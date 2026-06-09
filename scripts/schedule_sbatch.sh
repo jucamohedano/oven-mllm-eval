@@ -336,22 +336,20 @@ if [[ "$INF_DP" -gt 1 ]]; then
     # Index into whatever GPUs SLURM actually gave us
     IFS=',' read -ra ALLOC_GPUS <<< "\${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 
-    pids=()
-    for i in \$(seq 0 \$(($INF_DP - 1))); do
-        gpu="\${ALLOC_GPUS[\$i]}"
-        echo "[info] launching shard \$i on GPU \${gpu}"
-        CUDA_VISIBLE_DEVICES="\${gpu}" python -m scripts.run_inference \\
+    run_shard() {
+        local i="\$1" devs="\$2"
+        CUDA_VISIBLE_DEVICES="\$devs" python -u -m scripts.run_inference \\
             --input "$INF_INPUT" \\
             --model "$INF_MODEL" \\
             --prompt-variant "$INF_PROMPT" \\
             --method "$INF_METHOD" \\
             --output-dir "\${OUTPUT_DIR}" \\
-            --shard \$i --num-shards $INF_DP \\
+            --shard "\$i" --num-shards $INF_DP \\
             --temperature "$INF_TEMPERATURE" \\
             --top-p "$INF_TOP_P" \\
             --top-k "$INF_TOP_K" \\
             --max-tokens "$INF_MAX_TOKENS" \\
-            --tp 1 \\
+            --tp $INF_TP \\
             --gpu-util "$INF_GPU_UTIL" \\
             --max-model-len "$INF_MAX_MODEL_LEN" \\
             --max-num-seqs "$INF_MAX_NUM_SEQS" \\
@@ -364,7 +362,21 @@ if [[ "$INF_DP" -gt 1 ]]; then
             \$([ "$INF_METHOD" = "iterative" ] && echo "--attempts-per-round $INF_ATTEMPTS_PER_ROUND --max-rounds $INF_MAX_ROUNDS --enable-feedback $INF_FEEDBACK --max-feedback-chars $INF_MAX_FEEDBACK_CHARS") \\
             $MAX_EXAMPLES_FLAG \\
             $RESUME_FLAG \\
-            > "\${OUTPUT_DIR}/shard\${i}.log" 2>&1 &
+            2>&1 | stdbuf -oL sed "s/^/[shard \$i] /" | tee "\${OUTPUT_DIR}/shard\${i}.log"
+        return "\${PIPESTATUS[0]}"
+    }
+
+    need=\$(( $INF_DP * $INF_TP ))
+    if [[ \${need} -gt \${#ALLOC_GPUS[@]} ]]; then
+        echo "[error] --dp $INF_DP × --tp $INF_TP = \${need} GPUs, only \${#ALLOC_GPUS[@]} allocated" >&2
+        exit 1
+    fi
+
+    pids=()
+    for i in \$(seq 0 \$(($INF_DP - 1))); do
+        devs=\$(IFS=,; echo "\${ALLOC_GPUS[*]:\$((i * $INF_TP)):$INF_TP}")
+        echo "[info] launching shard \$i on GPUs \${devs} (TP=$INF_TP)"
+        run_shard "\$i" "\${devs}" &
         pids+=(\$!)
     done
 

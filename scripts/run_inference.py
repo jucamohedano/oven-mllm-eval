@@ -199,6 +199,7 @@ def run_iterative(
     enable_feedback: bool,
     max_feedback_chars: int,
     output_path: Path,
+    use_tqdm: bool = True,
 ):
     """Iterative resampling with optional feedback.
 
@@ -242,7 +243,7 @@ def run_iterative(
         print(f"[iterative] round {round_idx}/{max_rounds}: "
               f"{len(active)} active × n={attempts_per_round}")
 
-        outputs = llm.chat(conversations, round_sampling, use_tqdm=True)
+        outputs = llm.chat(conversations, round_sampling, use_tqdm=use_tqdm)
 
         newly_succeeded = []
         for state, request_output in zip(active, outputs):
@@ -410,6 +411,9 @@ def main():
         examples = examples[args.shard::args.num_shards]
         print(f"Shard {args.shard}/{args.num_shards}: {len(examples)} examples")
 
+    # Progress bars use \r redraws that collide when multiple shards share stdout.
+    show_tqdm = args.num_shards <= 1
+
     # Build output directory
     if args.output_dir:
         output_dir = Path(args.output_dir)
@@ -546,6 +550,7 @@ def main():
                 args.attempts_per_round, args.max_rounds,
                 args.enable_feedback, args.max_feedback_chars,
                 output_path,
+                use_tqdm=show_tqdm,
             )
     else:
         sampling_params = SamplingParams(**sampling_kwargs, max_tokens=args.max_tokens)
@@ -562,10 +567,10 @@ def main():
 
             if args.base_model:
                 chunk_prompts = raw_prompts[s:e]
-                outputs = llm.generate(chunk_prompts, sampling_params, use_tqdm=True)
+                outputs = llm.generate(chunk_prompts, sampling_params, use_tqdm=show_tqdm)
             else:
                 chunk_convs = conversations[s:e]
-                outputs = llm.chat(chunk_convs, sampling_params, use_tqdm=True)
+                outputs = llm.chat(chunk_convs, sampling_params, use_tqdm=show_tqdm)
 
             for example, request_output in zip(chunk_exs, outputs):
                 all_texts = [co.text for co in request_output.outputs]
@@ -601,6 +606,8 @@ def main():
                     }
 
                 append_jsonl(output_path, result)
+
+            print(f"[chunk {ci + 1}/{n_chunks}] done — {e}/{len(examples)} examples", flush=True)
 
     print(f"Done. Output: {output_dir}")
 
