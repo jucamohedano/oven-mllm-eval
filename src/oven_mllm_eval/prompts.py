@@ -22,6 +22,7 @@ PROMPT_VARIANTS = {
     "base_pretrained": "Q: {}\nA:",
     "barebones": "{} Answer in the format 'A: <answer>.'",
     "concise": "{} Answer questions directly and concisely. If you don't know, say 'I don't know'.",
+    "concise_no_idk": "{} Answer questions directly and concisely. If you don't know, give your best guess.",
     "default": (
         "{} Do not give any extra text. Do not answer in a full sentence. "
         "Do not specify your certainty about the answer. Give your best guess "
