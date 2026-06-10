@@ -4,7 +4,8 @@
 Supports three sampling modes:
 
   1. **naive**: single sample per example (n=1).
-  2. **naive-sampling**: draw N independent samples, pick the best match.
+  2. **naive-sampling**: draw N independent samples, write all rollouts
+     (verdicts deferred to the judge model).
   3. **iterative**: draw N samples per round for T rounds; if all fail
      matching, optionally feed back failed attempts and retry.
 
@@ -35,7 +36,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import secrets
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -83,7 +83,7 @@ def build_output_dir(model: str, method: str, prompt_variant: str, output_root: 
 
 
 # ---------------------------------------------------------------------------
-# Matching helpers
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _raise_missing_question(example: dict):
@@ -92,22 +92,6 @@ def _raise_missing_question(example: dict):
         f"Example missing 'question' field. Available keys: {sorted(example.keys())}. "
         f"Re-run prepare_oven.py with the correct raw data that includes 'question'."
     )
-
-
-def _matches_label(text: str, ground_truth: str) -> bool:
-    """Simple normalised string matching."""
-    label = _normalise(ground_truth)
-    if not label:
-        return False
-    answer_region = text.split("```")[-1]
-    answer = _normalise(answer_region)
-    return re.search(rf"(^| ){re.escape(label)}( |$)", answer) is not None
-
-
-def _normalise(text: str) -> str:
-    text = text.lower().replace("_", " ").replace("-", " ")
-    text = re.sub(r"[^a-z0-9 ]+", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
 
 
 def _build_feedback(round_idx: int, failed_texts: list[str], max_chars: int = 2000, final_round: bool = False) -> str:
@@ -229,7 +213,7 @@ def run_iterative(
             "idx": i,
             "conversation": [{"role": "user", "content": content}],
             "all_attempts": [],
-            "success": False,
+            "success": None,
             "success_round": 0,
             "best_response": "",
             "total_attempts": 0,
@@ -256,23 +240,17 @@ def run_iterative(
 
         newly_succeeded = []
         for state, request_output in zip(active, outputs):
-            ground_truth = examples[state["idx"]].get("answer", "")
             texts = [co.text for co in request_output.outputs]
             failed_texts: list[str] = []
 
             for attempt_idx, text in enumerate(texts, start=1):
                 state["total_attempts"] += 1
-                matched = _matches_label(text, ground_truth)
+                # Verdict deferred to judge (no _matches_label gate).
                 state["all_attempts"].append({
                     "round": round_idx, "attempt": attempt_idx,
-                    "text": text, "matched": matched,
+                    "text": text, "matched": None,
                 })
-                if matched and not state["success"]:
-                    state["success"] = True
-                    state["success_round"] = round_idx
-                    state["best_response"] = text
-                else:
-                    failed_texts.append(text)
+                failed_texts.append(text)
 
             if state["success"]:
                 newly_succeeded.append(state)
@@ -297,10 +275,8 @@ def run_iterative(
 
 def _write_iterative_result(state, example, prompt_variant, sampling_kwargs,
                             attempts_per_round, max_rounds, enable_feedback, output_path):
-    prediction = (
-        state["best_response"] if state["success"]
-        else (state["all_attempts"][-1]["text"] if state["all_attempts"] else "")
-    )
+    # Verdict deferred to judge; use first rollout as placeholder.
+    prediction = state["all_attempts"][0]["text"] if state["all_attempts"] else ""
     append_jsonl(output_path, {
         **example,
         "prediction": prediction,
@@ -592,17 +568,10 @@ def main():
 
             for example, request_output in zip(chunk_exs, outputs):
                 all_texts = [co.text for co in request_output.outputs]
-                ground_truth = example.get("answer", "")
 
                 if args.method == "naive-sampling":
-                    success = False
-                    best_text = all_texts[0] if all_texts else ""
-                    for t in all_texts:
-                        if _matches_label(t, ground_truth):
-                            success = True
-                            best_text = t
-                            break
-                    prediction = best_text if success else (all_texts[0] if all_texts else "")
+                    prediction = all_texts[0] if all_texts else ""
+                    # Verdict deferred to judge.
                     result = {
                         **example,
                         "prediction": prediction,
@@ -610,7 +579,7 @@ def main():
                         "prompt_variant": args.prompt_variant,
                         "sampling": f"temp={args.temperature}, top_p={args.top_p}, top_k={args.top_k}, n={n}",
                         "n_samples": n,
-                        "success": success,
+                        "success": None,
                         "all_texts": all_texts,
                     }
                 else:  # naive

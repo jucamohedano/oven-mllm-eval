@@ -85,7 +85,11 @@ def _score_rows(
                   .replace("<answer>", "").replace("</answer>", "")
                   .replace("<s>", "").replace("</s>", "")
                   .strip())
-        prediction = (row.get("prediction")
+        # judge_selected_text is the authoritative prediction when the
+        # judge ran (Phase 2); fall back to raw prediction for backward
+        # compatibility with pre-judge runs.
+        prediction = (row.get("judge_selected_text")
+                      or row.get("prediction")
                       or row.get("iter_final_prediction")
                       or row.get("output", ""))
         entity_id = row.get("entity_id")
@@ -285,6 +289,43 @@ def score_generation_file(
                 "num_examples": len(scored_rows), "num_mapped": 0,
             }
         summaries.append({"measure": matcher_name, "metrics": s})
+
+    # ── pass@k from judge verdicts ──────────────────────────────────
+    # Compute pass@k using the unbiased estimator from the Codex paper:
+    #   pass@k = E[ 1 - C(n-c, k) / C(n, k) ]
+    # where n = number of rollouts, c = number judged correct.
+    _judge_rows = [r for r in scored_rows if r.get("judge_verdicts")]
+    if _judge_rows:
+        from scipy.special import comb as _comb
+
+        _ns = [len(r["judge_verdicts"]) for r in _judge_rows]
+        _n_max = max(_ns) if _ns else 0
+        _candidate_ks = [2**i for i in range(0, 12)]  # 1, 2, 4, 8, ..., 2048
+        _ks = sorted({k for k in _candidate_ks if 0 < k <= _n_max})
+        _ks.append(_n_max)  # always include the full rollout count
+
+        _pass_at_k: dict[str, float] = {}
+        for _k in _ks:
+            _vals: list[float] = []
+            for _n, r in zip(_ns, _judge_rows):
+                _c = sum(r["judge_verdicts"])
+                if _n < _k:
+                    # Not enough samples for this k — pass if any correct.
+                    _vals.append(1.0 if _c > 0 else 0.0)
+                elif _n - _c < _k:
+                    # C(n-c, k) = 0 when n-c < k — at least one correct is guaranteed.
+                    _vals.append(1.0)
+                else:
+                    _vals.append(
+                        1.0
+                        - float(_comb(_n - _c, _k, exact=True))
+                        / float(_comb(_n, _k, exact=True))
+                    )
+            _pass_at_k[f"pass@{_k}"] = sum(_vals) / len(_vals)
+
+        # Attach pass@k to each measure's summary
+        for _s in summaries:
+            _s["metrics"].update(_pass_at_k)
 
     # Drop stale unprefixed keys from old scoring runs so rows stay clean
     _STALE_KEYS = {"scored_predicted_node", "scored_predicted_path",
