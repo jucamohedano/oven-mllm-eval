@@ -142,6 +142,7 @@ INF_MIN_PIXELS="65536"
 INF_CHUNK_SIZE="256"
 INF_ENFORCE_EAGER=false
 INF_BASE_MODEL=false
+INF_RESTART_EVERY="0"
 
 # ---------------------------------------------------------------------------
 # Parse arguments
@@ -189,6 +190,7 @@ main() {
             --chunk-size)      INF_CHUNK_SIZE="$2"; shift 2 ;;
             --enforce-eager)   INF_ENFORCE_EAGER=true; shift ;;
             --base-model)      INF_BASE_MODEL=true; shift ;;
+            --restart-every)   INF_RESTART_EVERY="$2"; shift 2 ;;
             --scoring-measure) SCORING_MEASURE="$2"; shift 2 ;;
             --scoring-workers) INF_SCORING_WORKERS="$2"; shift 2 ;;
             --judge-model)     INF_JUDGE_MODEL="$2"; shift 2 ;;
@@ -367,6 +369,7 @@ if [[ "$INF_DP" -gt 1 ]]; then
             $METHOD_FLAGS \\
             $MAX_EXAMPLES_FLAG \\
             $RESUME_FLAG \\
+            --restart-every $INF_RESTART_EVERY \\
             2>&1 | stdbuf -oL sed "s/^/[shard \$i] /" | tee "${OUTPUT_DIR}/shard\${i}.log"
         return "\${PIPESTATUS[0]}"
     }
@@ -420,7 +423,8 @@ else
         $IMAGE_ROOT_FLAG \\
         $METHOD_FLAGS \\
         $MAX_EXAMPLES_FLAG \\
-        $RESUME_FLAG
+        $RESUME_FLAG \\
+        --restart-every $INF_RESTART_EVERY
 fi
 JOB1EOF
 
@@ -605,6 +609,7 @@ if [[ "$INF_DP" -gt 1 ]]; then
             \$([ "$INF_METHOD" = "iterative" ] && echo "--attempts-per-round $INF_ATTEMPTS_PER_ROUND --max-rounds $INF_MAX_ROUNDS --enable-feedback $INF_FEEDBACK --max-feedback-chars $INF_MAX_FEEDBACK_CHARS") \\
             $MAX_EXAMPLES_FLAG \\
             $RESUME_FLAG \\
+            --restart-every $INF_RESTART_EVERY \\
             2>&1 | stdbuf -oL sed "s/^/[shard \$i] /" | tee "\${OUTPUT_DIR}/shard\${i}.log"
         return "\${PIPESTATUS[0]}"
     }
@@ -662,7 +667,8 @@ else
         \$([ "$INF_METHOD" = "naive-sampling" ] && echo "--samples-per-example $INF_SAMPLES_PER_EXAMPLE") \\
         \$([ "$INF_METHOD" = "iterative" ] && echo "--attempts-per-round $INF_ATTEMPTS_PER_ROUND --max-rounds $INF_MAX_ROUNDS --enable-feedback $INF_FEEDBACK --max-feedback-chars $INF_MAX_FEEDBACK_CHARS") \\
         $MAX_EXAMPLES_FLAG \\
-        $RESUME_FLAG
+        $RESUME_FLAG \\
+        --restart-every $INF_RESTART_EVERY
 
     EXPERIMENT_DIR="logs/schedule/oven_${INF_METHOD}_${INF_PROMPT}/\${MODEL_SLUG}"
     OUTPUT_DIR=\$(ls -1d "\${EXPERIMENT_DIR}"/20* 2>/dev/null | sort | tail -1)

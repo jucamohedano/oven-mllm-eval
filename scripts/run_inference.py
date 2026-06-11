@@ -361,6 +361,8 @@ def main():
     # limits
     parser.add_argument("--max-examples", type=int, default=None, help="Limit number of examples")
     parser.add_argument("--resume", action="store_true", help="Skip already-completed examples in output")
+    parser.add_argument("--restart-every", type=int, default=0,
+                        help="Restart vLLM engine every N chunks to avoid memory leak (0 = never)")
     # External data-parallel sharding: one process per GPU, each takes a stride.
     parser.add_argument("--shard", type=int, default=0, help="This process's shard index (0-based)")
     parser.add_argument("--num-shards", type=int, default=1,
@@ -535,6 +537,24 @@ def main():
         # all its rounds and writes before moving on.
         n_chunks = (len(examples) + args.chunk_size - 1) // args.chunk_size
         for ci in range(n_chunks):
+            # Periodic engine restart to work around vLLM 0.11.2 memory leak
+            if args.restart_every and ci > 0 and ci % args.restart_every == 0:
+                print(f"[restart] reinitializing engine after {args.restart_every} chunks")
+                del llm
+                llm = LLM(
+                    model=args.model,
+                    tensor_parallel_size=args.tp,
+                    gpu_memory_utilization=args.gpu_util,
+                    max_model_len=args.max_model_len,
+                    max_num_seqs=args.max_num_seqs,
+                    enable_prefix_caching=True,
+                    enforce_eager=args.enforce_eager,
+                    limit_mm_per_prompt={"image": 1},
+                    mm_processor_cache_gb=0,
+                    async_scheduling=True,
+                    trust_remote_code=True,
+                    **extra_llm_kwargs,
+                )
             s = ci * args.chunk_size
             e = min(s + args.chunk_size, len(examples))
             print(f"[chunk {ci + 1}/{n_chunks}] examples {s}–{e - 1}")
@@ -551,6 +571,25 @@ def main():
         n_chunks = (len(examples) + args.chunk_size - 1) // args.chunk_size
 
         for ci in range(n_chunks):
+            # Periodic engine restart to work around vLLM 0.11.2 memory leak
+            if args.restart_every and ci > 0 and ci % args.restart_every == 0:
+                print(f"[restart] reinitializing engine after {args.restart_every} chunks")
+                del llm
+                llm = LLM(
+                    model=args.model,
+                    tensor_parallel_size=args.tp,
+                    gpu_memory_utilization=args.gpu_util,
+                    max_model_len=args.max_model_len,
+                    max_num_seqs=args.max_num_seqs,
+                    enable_prefix_caching=True,
+                    enforce_eager=args.enforce_eager,
+                    limit_mm_per_prompt={"image": 1},
+                    mm_processor_cache_gb=0,
+                    async_scheduling=True,
+                    trust_remote_code=True,
+                    **extra_llm_kwargs,
+                )
+
             s = ci * args.chunk_size
             e = min(s + args.chunk_size, len(examples))
             chunk_exs = examples[s:e]
