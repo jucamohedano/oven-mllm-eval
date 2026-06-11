@@ -151,8 +151,15 @@ main() {
     if [[ -n "$INF_JUDGE_MODEL" ]]; then
         SLURM_NAME="${SLURM_NAME}-judge"
         SLURM_CPUS="8"
-        SLURM_MEM="64G"
-        JOB_TYPE="$INF_JUDGE_GPUS GPU$( [[ $INF_JUDGE_GPUS -gt 1 ]] && echo s) (judge + score)"
+        # Only upgrade mem if user didn't set it explicitly (default is 30G).
+        if [[ "$SLURM_MEM" == "30G" ]]; then
+            SLURM_MEM="64G"
+        fi
+        if [[ $INF_JUDGE_GPUS -gt 1 ]]; then
+            JOB_TYPE="$INF_JUDGE_GPUS GPUs (judge + score)"
+        else
+            JOB_TYPE="1 GPU (judge + score)"
+        fi
     else
         JOB_TYPE="CPU-only (score)"
     fi
@@ -233,7 +240,7 @@ if [[ -n "$INF_JUDGE_MODEL" ]]; then
         TMPD=\$(mktemp -d)
         split -n l/$INF_JUDGE_GPUS "\$SAMPLES" "\$TMPD/shard_"
         pids=()
-        for i in \$(seq 0 \$((INF_JUDGE_GPUS - 1))); do
+        for i in \$(seq 0 $((INF_JUDGE_GPUS - 1))); do
             SHARD_IN=\$(ls "\$TMPD"/shard_* | sed -n "\$((i+1))p")
             SHARD_OUT="\$TMPD/judged_shard_\${i}.jsonl"
             CUDA_VISIBLE_DEVICES=\$i python -m scripts.run_judge \\
