@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from vllm import LLM, SamplingParams
@@ -107,29 +108,73 @@ def main():
     )
 
     # ------------------------------------------------------------------
-    # Judge loop — per-example batching for prefix-cache reuse
+    # Judge loop — flat batch per chunk for max GPU utilization
+    #
+    # Each chunk flattens ALL rollouts into one llm.generate() call so
+    # vLLM's scheduler can fill max_num_seqs, keeping the GPU saturated.
+    # Per-example results are reconstructed from the flat output list.
+    # A crash loses at most one chunk (~1 min with chunk_size=256).
     # ------------------------------------------------------------------
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Resume: skip examples already written to the output file.
+    done_ids: set[str] = set()
+    if output_path.exists():
+        with open(output_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                done_ids.add(row.get("data_id", row.get("image_id", "")))
+
     n_chunks = (len(examples) + args.chunk_size - 1) // args.chunk_size
     total_examples = len(examples)
-    processed = 0
+    processed = len(done_ids)
     parse_errors = 0
 
-    print(f"Judging {total_examples} examples (chunk_size={args.chunk_size})")
+    print(f"Judging {total_examples} examples (chunk_size={args.chunk_size})"
+          + (f", resuming from {processed}" if processed else ""))
 
     for ci in range(n_chunks):
         s = ci * args.chunk_size
         e = min(s + args.chunk_size, total_examples)
-        chunk = examples[s:e]
-        print(f"[chunk {ci + 1}/{n_chunks}] examples {s}–{e - 1}")
+        chunk = [ex for ex in examples[s:e]
+                 if ex.get("data_id", ex.get("image_id", "")) not in done_ids]
+        if not chunk:
+            continue
+        now_str = datetime.now().strftime("%H:%M:%S")
+        print(f"{now_str}  [chunk {ci + 1}/{n_chunks}] examples {s}–{e - 1}"
+              + f" ({len(chunk)} remaining)")
+
+        # Build flat prompt list + per-example boundary metadata.
+        all_prompts: list[str] = []
+        boundaries: list[tuple[dict, int]] = []  # (example, num_rollouts)
 
         for example in chunk:
             all_texts = example.get("all_texts", [])
-
             if not all_texts:
-                # Empty rollouts — write through with empty verdicts
+                boundaries.append((example, 0))
+                continue
+            question = example.get("question", "")
+            ground_truth = example.get("answer", "")
+            for rollout_text in all_texts:
+                all_prompts.append(
+                    build_judge_prompt(question, ground_truth, rollout_text)
+                )
+            boundaries.append((example, len(all_texts)))
+
+        # One llm.generate() call — vLLM schedules all prompts optimally.
+        all_outputs = llm.generate(all_prompts, sampling_params) if all_prompts else []
+
+        # Reconstruct per-example results from the flat output list.
+        idx = 0
+        for example, n_rollouts in boundaries:
+            if n_rollouts == 0:
                 append_jsonl(output_path, {
                     **example,
                     "judge_verdicts": [],
@@ -142,22 +187,13 @@ def main():
                 processed += 1
                 continue
 
-            question = example.get("question", "")
-            ground_truth = example.get("answer", "")
-
-            # Batch all k rollouts into one llm.generate() call.
-            # The shared prefix (instructions + question + ground_truth)
-            # hits the KV cache for rollouts 2..k.
-            prompts = [
-                build_judge_prompt(question, ground_truth, rollout_text)
-                for rollout_text in all_texts
-            ]
-
-            outputs = llm.generate(prompts, sampling_params)
+            all_texts = example.get("all_texts", [])
+            example_outputs = all_outputs[idx:idx + n_rollouts]
+            idx += n_rollouts
 
             verdicts: list[bool] = []
             reasons: list[str] = []
-            for output in outputs:
+            for output in example_outputs:
                 try:
                     v, r = parse_judge_output(output.outputs[0].text)
                 except JudgeParseError:
@@ -189,7 +225,8 @@ def main():
             })
             processed += 1
 
-        print(f"[chunk {ci + 1}/{n_chunks}] done — {e}/{total_examples} examples")
+        now_str = datetime.now().strftime("%H:%M:%S")
+        print(f"{now_str}  [chunk {ci + 1}/{n_chunks}] done — {processed}/{total_examples} examples")
 
     # ------------------------------------------------------------------
     # Write metadata
