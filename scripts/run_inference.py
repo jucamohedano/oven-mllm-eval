@@ -35,9 +35,11 @@ Usage examples::
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import secrets
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -133,6 +135,37 @@ def _load_pil(path: str) -> Image.Image:
     if img.mode not in ("RGB", "L"):
         img = img.convert("RGB")
     return img
+
+
+def _resolve_image_path(path: str, root: Path) -> str:
+    """Resolve a (possibly relative) image path and verify it exists.
+
+    Cheap preflight (stat only, no decode) so a missing file fails the run
+    immediately instead of at chunk N.  Returns the resolved path string.
+    """
+    if not path:
+        raise ValueError("Empty image_path in example")
+    p = Path(path) if Path(path).is_absolute() else root / path
+    if not p.exists():
+        for ext in (".JPEG", ".jpeg", ".JPG"):
+            alt = p.with_suffix(ext)
+            if alt.exists():
+                return str(alt)
+        raise FileNotFoundError(f"Image not found: {p.resolve()} (cwd={Path.cwd()})")
+    return str(p)
+
+
+def _load_images(paths: list[str]) -> list[Image.Image]:
+    """Decode a batch of images in parallel.
+
+    Called per chunk (NOT upfront for the whole dataset): PIL pixel buffers
+    for 60k+ images would otherwise accumulate in host RAM as vLLM touches
+    them, growing RSS monotonically until the SLURM cgroup OOM-kills the
+    engine core process.  Loading per chunk keeps the working set to one
+    chunk and lets the GC reclaim it after each llm.chat() call.
+    """
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        return list(pool.map(_load_pil, paths))
 
 
 # ---------------------------------------------------------------------------
@@ -348,6 +381,10 @@ def main():
                         help="Min pixels for image resizing (default: 65536 = 256x256)")
     parser.add_argument("--enforce-eager", action="store_true",
                         help="Disable CUDA graphs — slower but more uniform step latency")
+    parser.add_argument("--async-scheduling", action="store_true",
+                        help="Enable vLLM async scheduling. Off by default: there are "
+                             "known EngineCore crash reports for Qwen3-VL + multimodal "
+                             "with async scheduling enabled on 0.11.x.")
     parser.add_argument("--base-model", action="store_true",
                         help="Use LLM.generate() with raw prompts (for base/pretrained models "
                              "that lack a chat template)")
@@ -417,35 +454,49 @@ def main():
     # Resume support — filter before loading images
     if args.resume and output_path.exists():
         done_ids = set()
+        valid_lines: list[str] = []
+        n_bad = 0
         with open(output_path, "r") as f:
             for line in f:
-                row = json.loads(line)
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    # A SIGKILL (e.g. cgroup OOM) mid-write can truncate the
+                    # final line.  Drop it so the example re-runs and
+                    # downstream readers (merge/judge/score) don't choke.
+                    n_bad += 1
+                    continue
+                valid_lines.append(line)
                 done_ids.add(row.get("data_id", row.get("image_id", "")))
+        if n_bad:
+            print(f"Resuming: dropping {n_bad} malformed line(s) from {output_path}")
+            tmp = output_path.with_name(output_path.name + ".tmp")
+            with open(tmp, "w") as f:
+                for line in valid_lines:
+                    f.write(line + "\n")
+            tmp.replace(output_path)
         examples = [e for e in examples if e.get("data_id", e.get("image_id", "")) not in done_ids]
         print(f"Resuming: {len(done_ids)} already done, {len(examples)} remaining")
 
     # Resolve image paths — relative paths break when cwd != project root
     # (SLURM, DP shard processes).  Defaults to cwd; use --image-root to override.
+    #
+    # IMPORTANT: we only *resolve and stat* paths here.  Decoding all images
+    # upfront (and keeping them referenced via per-example conversations)
+    # makes host RSS grow chunk after chunk as PIL lazily materialises pixel
+    # buffers — which looks exactly like an engine "memory leak" and ends in
+    # the cgroup OOM-killer SIGKILLing the EngineCore process.  Images are
+    # now decoded per chunk inside the inference loop.
     image_root = Path(args.image_root) if args.image_root else Path.cwd()
-    print(f"Loading images... (root: {image_root})")
+    print(f"Resolving image paths... (root: {image_root})")
     with ThreadPoolExecutor(max_workers=16) as pool:
-        resolved = [
-            str(image_root / p) if not Path(p).is_absolute() else p
-            for p in [e.get("image_path", "") for e in examples]
-        ]
-        images = list(pool.map(_load_pil, resolved))
-
-    # Build prompts (conversations for instruct, raw dicts for base)
-    if args.base_model:
-        raw_prompts = [
-            _make_raw_prompt(ex, img, args.prompt_variant)
-            for ex, img in zip(examples, images)
-        ]
-    else:
-        conversations = [
-            _make_conversation(ex, img, args.prompt_variant)
-            for ex, img in zip(examples, images)
-        ]
+        resolved_paths = list(pool.map(
+            lambda p: _resolve_image_path(p, image_root),
+            [e.get("image_path", "") for e in examples],
+        ))
 
     # Build vLLM engine
     print(f"Initializing vLLM engine: model={args.model} tp={args.tp} max_model_len={args.max_model_len}")
@@ -459,20 +510,42 @@ def main():
             "min_pixels": args.min_pixels,
         }
 
-    llm = LLM(
-        model=args.model,
-        tensor_parallel_size=args.tp,
-        gpu_memory_utilization=args.gpu_util,
-        max_model_len=args.max_model_len,
-        max_num_seqs=args.max_num_seqs,
-        enable_prefix_caching=True,
-        enforce_eager=args.enforce_eager,
-        limit_mm_per_prompt={"image": 1},
-        mm_processor_cache_gb=0,
-        async_scheduling=True,
-        trust_remote_code=True,
-        **extra_llm_kwargs,
-    )
+    def _build_engine() -> LLM:
+        return LLM(
+            model=args.model,
+            tensor_parallel_size=args.tp,
+            gpu_memory_utilization=args.gpu_util,
+            max_model_len=args.max_model_len,
+            max_num_seqs=args.max_num_seqs,
+            enable_prefix_caching=True,
+            enforce_eager=args.enforce_eager,
+            limit_mm_per_prompt={"image": 1},
+            mm_processor_cache_gb=0,
+            async_scheduling=args.async_scheduling,
+            trust_remote_code=True,
+            **extra_llm_kwargs,
+        )
+
+    def _restart_engine(old: LLM) -> LLM:
+        """Tear down the engine as thoroughly as in-process restart allows.
+
+        NOTE: this is best-effort.  In vLLM V1 the engine core runs in a
+        child process and `del llm` does not synchronously release GPU
+        memory, nor does it reclaim anything leaked in *this* (parent)
+        process where multimodal preprocessing runs.  For long jobs prefer
+        the process-level restart loop in schedule_sbatch.sh (--resume).
+        """
+        del old
+        gc.collect()
+        try:
+            import torch
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        time.sleep(10)  # give the old EngineCore process time to exit
+        return _build_engine()
+
+    llm = _build_engine()
 
     print(f"Running {args.method} inference on {len(examples)} examples")
     print(f"  Model:     {args.model}")
@@ -503,6 +576,7 @@ def main():
             "max_pixels": args.max_pixels,
             "min_pixels": args.min_pixels,
             "enforce_eager": args.enforce_eager,
+            "async_scheduling": args.async_scheduling,
         },
         "data": {
             "input": args.input,
@@ -539,33 +613,21 @@ def main():
         for ci in range(n_chunks):
             # Periodic engine restart to work around vLLM 0.11.2 memory leak
             if args.restart_every and ci > 0 and ci % args.restart_every == 0:
-                print(f"[restart] reinitializing engine after {args.restart_every} chunks")
-                del llm
-                llm = LLM(
-                    model=args.model,
-                    tensor_parallel_size=args.tp,
-                    gpu_memory_utilization=args.gpu_util,
-                    max_model_len=args.max_model_len,
-                    max_num_seqs=args.max_num_seqs,
-                    enable_prefix_caching=True,
-                    enforce_eager=args.enforce_eager,
-                    limit_mm_per_prompt={"image": 1},
-                    mm_processor_cache_gb=0,
-                    async_scheduling=True,
-                    trust_remote_code=True,
-                    **extra_llm_kwargs,
-                )
+                print(f"[restart] reinitializing engine after {args.restart_every} chunks", flush=True)
+                llm = _restart_engine(llm)
             s = ci * args.chunk_size
             e = min(s + args.chunk_size, len(examples))
             print(f"[chunk {ci + 1}/{n_chunks}] examples {s}–{e - 1}")
+            chunk_images = _load_images(resolved_paths[s:e])
             run_iterative(
-                llm, examples[s:e], images[s:e], args.prompt_variant,
+                llm, examples[s:e], chunk_images, args.prompt_variant,
                 sampling_kwargs, args.max_tokens,
                 args.attempts_per_round, args.max_rounds,
                 args.enable_feedback, args.max_feedback_chars,
                 output_path,
                 use_tqdm=show_tqdm,
             )
+            del chunk_images
     else:
         sampling_params = SamplingParams(**sampling_kwargs, max_tokens=args.max_tokens)
         n_chunks = (len(examples) + args.chunk_size - 1) // args.chunk_size
@@ -573,22 +635,8 @@ def main():
         for ci in range(n_chunks):
             # Periodic engine restart to work around vLLM 0.11.2 memory leak
             if args.restart_every and ci > 0 and ci % args.restart_every == 0:
-                print(f"[restart] reinitializing engine after {args.restart_every} chunks")
-                del llm
-                llm = LLM(
-                    model=args.model,
-                    tensor_parallel_size=args.tp,
-                    gpu_memory_utilization=args.gpu_util,
-                    max_model_len=args.max_model_len,
-                    max_num_seqs=args.max_num_seqs,
-                    enable_prefix_caching=True,
-                    enforce_eager=args.enforce_eager,
-                    limit_mm_per_prompt={"image": 1},
-                    mm_processor_cache_gb=0,
-                    async_scheduling=True,
-                    trust_remote_code=True,
-                    **extra_llm_kwargs,
-                )
+                print(f"[restart] reinitializing engine after {args.restart_every} chunks", flush=True)
+                llm = _restart_engine(llm)
 
             s = ci * args.chunk_size
             e = min(s + args.chunk_size, len(examples))
@@ -598,11 +646,20 @@ def main():
             api_label = "llm.generate()" if args.base_model else "llm.chat()"
             print(f"[chunk {ci + 1}/{n_chunks}] {n_ex} examples × n={n} [{api_label}]")
 
+            # Decode this chunk's images and build prompts now — and only
+            # now — so their memory can be reclaimed after the chunk.
+            chunk_images = _load_images(resolved_paths[s:e])
             if args.base_model:
-                chunk_prompts = raw_prompts[s:e]
+                chunk_prompts = [
+                    _make_raw_prompt(ex, img, args.prompt_variant)
+                    for ex, img in zip(chunk_exs, chunk_images)
+                ]
                 outputs = llm.generate(chunk_prompts, sampling_params, use_tqdm=show_tqdm)
             else:
-                chunk_convs = conversations[s:e]
+                chunk_convs = [
+                    _make_conversation(ex, img, args.prompt_variant)
+                    for ex, img in zip(chunk_exs, chunk_images)
+                ]
                 outputs = llm.chat(chunk_convs, sampling_params, use_tqdm=show_tqdm)
 
             for example, request_output in zip(chunk_exs, outputs):
@@ -633,6 +690,9 @@ def main():
 
                 append_jsonl(output_path, result)
 
+            # Drop chunk-local references so PIL buffers, processed mm
+            # inputs and RequestOutputs are reclaimable before next chunk.
+            del outputs, chunk_images
             print(f"[chunk {ci + 1}/{n_chunks}] done — {e}/{len(examples)} examples", flush=True)
 
     print(f"Done. Output: {output_dir}")
