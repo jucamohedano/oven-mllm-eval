@@ -11,29 +11,39 @@ fi
 if [[ "${1-}" =~ ^-*h(elp)?$ ]]; then
     echo 'usage: schedule_scoring.sh [-h] [OPTIONS]
 
-Schedule a CPU-only scoring job on the SLURM cluster.  No GPUs required.
+Schedule a judge + scoring job (1 GPU) or a CPU-only scoring job on SLURM.
 
-Example — score the latest 4B inference output on the free CPU partition:
+When --judge-model is set, the job requests 1 GPU and runs the judge on the
+input samples before scoring.  Otherwise the job is CPU-only and just scores.
 
+Examples:
+
+    # Judge + score on partial shard outputs (merge first, then submit):
+    cat results/RUN_DIR/*_samples_shard*.jsonl > results/RUN_DIR/RUN_ID_samples.jsonl
     bash scripts/schedule_scoring.sh \
-        --input logs/schedule/oven_naive-sampling_barebones/qwen_qwen3-vl-4b-instruct/20260527_180244_074760/20260527_180244_074760_samples.jsonl
+        --input results/RUN_DIR/RUN_ID_samples.jsonl \
+        --judge-model Qwen/Qwen3-8B
 
-Example — score with multiple measures using 8 cores on a DCGP node:
-
+    # Score only (CPU):
     bash scripts/schedule_scoring.sh \
-        --input logs/schedule/oven_naive-sampling_barebones/qwen_qwen3-vl-8b-instruct/20260101_120000_000000/20260101_120000_000000_samples.jsonl \
-        --measure exact_match contained \
-        --num-workers 8 \
-        --partition dcgp_usr_prod \
-        --cpus 8
+        --input results/RUN_DIR/RUN_ID_samples.jsonl
 
 Slurm options:
-    -p, --partition <PARTITION>   Partition (default: lrd_all_serial — free CPU tier)
-    -A, --account <ACCOUNT>       Account (default: none needed for lrd_all_serial)
-    -c, --cpus <CPUS>             CPUs per task (default: 4)
-    -m, --mem <MEM>               Memory limit (default: 30G)
+    -p, --partition <PARTITION>   Partition (default: boost_usr_prod)
+    -A, --account <ACCOUNT>       Account (default: none)
+    -c, --cpus <CPUS>             CPUs per task (default: 8 for judge, 4 for score)
+    -m, --mem <MEM>               Memory limit (default: 64G for judge, 30G for score)
     -t, --time <TIME>             Time limit (default: 04:00:00)
-    -n, --name <NAME>             Job name (default: oven-score)
+    -n, --name <NAME>             Job name (default: oven-judge-score / oven-score)
+
+Judge options:
+    --judge-model <MODEL>         Text-only judge model. When set, requests 1 GPU and
+                                  runs the judge before scoring.
+    --judge-gpus <N>              Number of GPUs for the judge (default: 1).
+                                  When > 1, splits input and runs parallel judge instances.
+    --judge-max-model-len <LEN>   Judge max context length (default: 2048)
+    --judge-max-num-seqs <N>      Judge max concurrent sequences (default: 1024)
+    --judge-gpu-util <UTIL>       Judge GPU memory utilization (default: 0.92)
 
 Scoring options:
     --input <PATH>                Input samples JSONL (required)
@@ -43,7 +53,7 @@ Scoring options:
                                   (default: data/processed/oven_taxonomy_index.json)
     --measure <MEASURE> [...]     Measure(s): exact_match, contained, all
                                   (default: exact_match).  Space-separate for multiple.
-    --num-workers <N>             CPU workers for parallel scoring (default: 4)
+    --num-workers <N>             CPU workers for parallel scoring (default: 0 = auto)
 '
     exit 0
 fi
@@ -56,19 +66,26 @@ while [ "$(find . -maxdepth 1 -name pyproject.toml | wc -l)" -ne 1 ]; do cd ..; 
 # ---------------------------------------------------------------------------
 
 # SLURM
-SLURM_PARTITION="lrd_all_serial"
+SLURM_PARTITION="boost_usr_prod"
 SLURM_ACCOUNT=""
 SLURM_CPUS="4"
 SLURM_MEM="30G"
 SLURM_TIME="04:00:00"
 SLURM_NAME="oven-score"
 
+# Judge
+INF_JUDGE_MODEL=""
+INF_JUDGE_GPUS="1"
+INF_JUDGE_MAX_MODEL_LEN="2048"
+INF_JUDGE_MAX_NUM_SEQS="1024"
+INF_JUDGE_GPU_UTIL="0.92"
+
 # Scoring
 SCORING_INPUT=""
 SCORING_OUTPUT=""
 SCORING_TAXONOMY_INDEX="data/processed/oven_taxonomy_index.json"
 SCORING_MEASURE="exact_match"
-SCORING_NUM_WORKERS="4"
+SCORING_NUM_WORKERS="0"
 
 # ---------------------------------------------------------------------------
 # Parse arguments
@@ -92,11 +109,16 @@ main() {
             --taxonomy-index)  SCORING_TAXONOMY_INDEX="$2"; shift 2 ;;
             --measure)         SCORING_MEASURE="$2"; shift 2 ;;
             --num-workers)     SCORING_NUM_WORKERS="$2"; shift 2 ;;
+            --judge-model)     INF_JUDGE_MODEL="$2"; shift 2 ;;
+            --judge-gpus)      INF_JUDGE_GPUS="$2"; shift 2 ;;
+            --judge-max-model-len) INF_JUDGE_MAX_MODEL_LEN="$2"; shift 2 ;;
+            --judge-max-num-seqs)  INF_JUDGE_MAX_NUM_SEQS="$2"; shift 2 ;;
+            --judge-gpu-util)   INF_JUDGE_GPU_UTIL="$2"; shift 2 ;;
             *) echo "Error: unknown option: $1" >&2; exit 1 ;;
         esac
     done
 
-    # Validate required
+    # Validate
     if [[ -z "$SCORING_INPUT" ]]; then
         echo "[error] --input is required" >&2
         exit 1
@@ -118,11 +140,21 @@ main() {
         SLURM_ACCOUNT_DIRECTIVE="#SBATCH --account=$SLURM_ACCOUNT"
     fi
 
-    # Default output: <input_dir>/<run_id>_scored.jsonl
+    # Default output
     if [[ -z "$SCORING_OUTPUT" ]]; then
         INPUT_DIR="$(dirname "$SCORING_INPUT")"
         INPUT_BASENAME="$(basename "$SCORING_INPUT" .jsonl)"
         SCORING_OUTPUT="${INPUT_DIR}/${INPUT_BASENAME}_scored.jsonl"
+    fi
+
+    # Judge defaults
+    if [[ -n "$INF_JUDGE_MODEL" ]]; then
+        SLURM_NAME="${SLURM_NAME}-judge"
+        SLURM_CPUS="8"
+        SLURM_MEM="64G"
+        JOB_TYPE="$INF_JUDGE_GPUS GPU$( [[ $INF_JUDGE_GPUS -gt 1 ]] && echo s) (judge + score)"
+    else
+        JOB_TYPE="CPU-only (score)"
     fi
 
     # Pre-flight: venv must exist
@@ -135,16 +167,24 @@ main() {
 
     mkdir -p ./logs/slurm
 
-    echo "[info] Scheduling scoring job:"
+    echo "[info] Scheduling $JOB_TYPE job:"
     echo "  Input:        $SCORING_INPUT"
     echo "  Output:       $SCORING_OUTPUT"
     echo "  Measure:      $SCORING_MEASURE"
     echo "  Workers:      $SCORING_NUM_WORKERS"
+    if [[ -n "$INF_JUDGE_MODEL" ]]; then
+        echo "  Judge model:  $INF_JUDGE_MODEL  (GPUs=$INF_JUDGE_GPUS)"
+    fi
     echo "  Partition:    $SLURM_PARTITION"
     echo "  CPUs:         $SLURM_CPUS"
     echo "  Mem:          $SLURM_MEM"
     echo "  Time:         $SLURM_TIME"
     echo ""
+
+    GPU_DIRECTIVE=""
+    if [[ -n "$INF_JUDGE_MODEL" ]]; then
+        GPU_DIRECTIVE="#SBATCH --gres=gpu:$INF_JUDGE_GPUS"
+    fi
 
     sbatch <<EOT
 #!/bin/bash
@@ -156,6 +196,7 @@ $SLURM_ACCOUNT_DIRECTIVE
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=$SLURM_CPUS
+$GPU_DIRECTIVE
 #SBATCH --mem=$SLURM_MEM
 #SBATCH --time=$SLURM_TIME
 
@@ -164,25 +205,66 @@ trap 'kill 0' EXIT
 
 cd "\$SLURM_SUBMIT_DIR"
 
-module load gcc/12.2.0
-
+module load nvhpc/24.5 gcc/12.2.0
+export CC=gcc CXX=g++ OMP_NUM_THREADS=1
+if [[ -f ".env" ]]; then set -a; source .env; set +a; fi
 source .venv/bin/activate
 
-echo "[info] Scoring \$SLURM_JOB_ID on \$(hostname)"
+echo "[info] \$SLURM_JOB_ID on \$(hostname)"
 echo "  Input:    $SCORING_INPUT"
 echo "  Output:   $SCORING_OUTPUT"
-echo "  Measure:  $SCORING_MEASURE"
-echo "  Workers:  $SCORING_NUM_WORKERS"
-echo ""
 
+SAMPLES="$SCORING_INPUT"
+
+if [[ -n "$INF_JUDGE_MODEL" ]]; then
+    echo "[info] Judging \$SAMPLES (GPUs=$INF_JUDGE_GPUS)..."
+    JUDGED="\$(dirname "\$SAMPLES")/\$(basename "\$SAMPLES" .jsonl)_judged.jsonl"
+
+    if [[ "$INF_JUDGE_GPUS" -le 1 ]]; then
+        CUDA_VISIBLE_DEVICES=0 python -m scripts.run_judge \\
+            --input "\$SAMPLES" \\
+            --output "\$JUDGED" \\
+            --judge-model "$INF_JUDGE_MODEL" \\
+            --max-model-len "$INF_JUDGE_MAX_MODEL_LEN" \\
+            --max-num-seqs "$INF_JUDGE_MAX_NUM_SEQS" \\
+            --gpu-util "$INF_JUDGE_GPU_UTIL"
+    else
+        echo "[info] Splitting input across $INF_JUDGE_GPUS GPUs..."
+        TMPD=\$(mktemp -d)
+        split -n l/$INF_JUDGE_GPUS "\$SAMPLES" "\$TMPD/shard_"
+        pids=()
+        for i in \$(seq 0 \$((INF_JUDGE_GPUS - 1))); do
+            SHARD_IN=\$(ls "\$TMPD"/shard_* | sed -n "\$((i+1))p")
+            SHARD_OUT="\$TMPD/judged_shard_\${i}.jsonl"
+            CUDA_VISIBLE_DEVICES=\$i python -m scripts.run_judge \\
+                --input "\$SHARD_IN" \\
+                --output "\$SHARD_OUT" \\
+                --judge-model "$INF_JUDGE_MODEL" \\
+                --max-model-len "$INF_JUDGE_MAX_MODEL_LEN" \\
+                --max-num-seqs "$INF_JUDGE_MAX_NUM_SEQS" \\
+                --gpu-util "$INF_JUDGE_GPU_UTIL" &
+            pids+=(\$!)
+        done
+        fail=0
+        for pid in "\${pids[@]}"; do wait "\$pid" || fail=1; done
+        if [[ \$fail -ne 0 ]]; then
+            echo "[error] a judge shard failed" >&2; exit 1
+        fi
+        cat "\$TMPD"/judged_shard_*.jsonl > "\$JUDGED"
+        rm -rf "\$TMPD"
+    fi
+    SAMPLES="\$JUDGED"
+fi
+
+echo "[info] Scoring \$SAMPLES..."
 python -m scripts.score_predictions \\
-    --input "$SCORING_INPUT" \\
+    --input "\$SAMPLES" \\
     --output "$SCORING_OUTPUT" \\
     --taxonomy-index "$SCORING_TAXONOMY_INDEX" \\
     --measure $SCORING_MEASURE \\
     --num-workers $SCORING_NUM_WORKERS
 
-echo "[info] Done."
+echo "[info] Done. Output: $SCORING_OUTPUT"
 EOT
 }
 
