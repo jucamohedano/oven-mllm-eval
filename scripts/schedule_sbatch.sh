@@ -66,6 +66,12 @@ vLLM engine options:
     --max-pixels <N>              Max pixels for image resizing (default: 262144 = 512x512)
     --min-pixels <N>              Min pixels for image resizing (default: 65536 = 256x256)
     --chunk-size <N>              Examples per llm.chat() call (default: 256)
+    --max-restarts <N>            Max process-level restarts after a crash; each restart
+                                  relaunches run_inference.py with --resume so completed
+                                  examples are skipped (default: 20)
+    --restart-every <N>           In-process engine reinit every N chunks (default: 0 = never).
+                                  Best-effort only — does NOT reclaim parent-process RAM;
+                                  prefer the automatic --resume restart loop.
     --enforce-eager               Disable CUDA graphs — slower but more uniform latency
     --base-model                  Use LLM.generate() with raw prompts (for base/pretrained models)
 
@@ -143,6 +149,7 @@ INF_CHUNK_SIZE="256"
 INF_ENFORCE_EAGER=false
 INF_BASE_MODEL=false
 INF_RESTART_EVERY="0"
+INF_MAX_RESTARTS="20"
 
 # ---------------------------------------------------------------------------
 # Parse arguments
@@ -191,6 +198,7 @@ main() {
             --enforce-eager)   INF_ENFORCE_EAGER=true; shift ;;
             --base-model)      INF_BASE_MODEL=true; shift ;;
             --restart-every)   INF_RESTART_EVERY="$2"; shift 2 ;;
+            --max-restarts)    INF_MAX_RESTARTS="$2"; shift 2 ;;
             --scoring-measure) SCORING_MEASURE="$2"; shift 2 ;;
             --scoring-workers) INF_SCORING_WORKERS="$2"; shift 2 ;;
             --judge-model)     INF_JUDGE_MODEL="$2"; shift 2 ;;
@@ -319,6 +327,8 @@ trap 'kill 0' EXIT
 cd "\$SLURM_SUBMIT_DIR"
 module load nvhpc/24.5 gcc/12.2.0
 export CC=gcc CXX=g++ OMP_NUM_THREADS=1
+export MALLOC_ARENA_MAX=2 MALLOC_TRIM_THRESHOLD_=0
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 if [[ -f ".env" ]]; then set -a; source .env; set +a; fi
 source .venv/bin/activate
 
@@ -340,38 +350,60 @@ fi
 echo "[info] Job 1 (inference): method=$INF_METHOD prompt=$INF_PROMPT temp=$INF_TEMPERATURE"
 echo "[info] Output dir: $OUTPUT_DIR"
 
+# Background memory timeline — one row/min of per-GPU used MiB and host
+# free/used GiB.  Lets you tell a steady leak from a one-chunk spike after
+# a crash.  Cleaned up automatically by the 'trap kill 0 EXIT' above.
+( while true; do
+    ts=\$(date +%H:%M:%S)
+    gpu=\$(nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null | paste -sd';' -)
+    host=\$(free -g | awk '/^Mem:/{printf "used=%sG free=%sG", \$3, \$4}')
+    echo "\$ts | host \$host | gpu[idx,used,total] \$gpu"
+    sleep 60
+  done ) > "$OUTPUT_DIR/mem_timeline.log" 2>&1 &
+
 if [[ "$INF_DP" -gt 1 ]]; then
     IFS=',' read -ra ALLOC_GPUS <<< "\${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 
     run_shard() {
         local i="\$1" devs="\$2"
-        CUDA_VISIBLE_DEVICES="\$devs" python -u -m scripts.run_inference \\
-            --input "$INF_INPUT" \\
-            --model "$INF_MODEL" \\
-            --prompt-variant "$INF_PROMPT" \\
-            --method "$INF_METHOD" \\
-            --output-dir "$OUTPUT_DIR" \\
-            --shard "\$i" --num-shards $INF_DP \\
-            --temperature "$INF_TEMPERATURE" \\
-            --top-p "$INF_TOP_P" \\
-            --top-k "$INF_TOP_K" \\
-            --max-tokens "$INF_MAX_TOKENS" \\
-            --tp $INF_TP \\
-            --gpu-util "$INF_GPU_UTIL" \\
-            --max-model-len "$INF_MAX_MODEL_LEN" \\
-            --max-num-seqs "$INF_MAX_NUM_SEQS" \\
-            --max-pixels "$INF_MAX_PIXELS" \\
-            --min-pixels "$INF_MIN_PIXELS" \\
-            --chunk-size "$INF_CHUNK_SIZE" \\
-            $ENFORCE_EAGER_FLAG \\
-            $BASE_MODEL_FLAG \\
-            $IMAGE_ROOT_FLAG \\
-            $METHOD_FLAGS \\
-            $MAX_EXAMPLES_FLAG \\
-            $RESUME_FLAG \\
-            --restart-every $INF_RESTART_EVERY \\
-            2>&1 | stdbuf -oL sed "s/^/[shard \$i] /" | tee "${OUTPUT_DIR}/shard\${i}.log"
-        return "\${PIPESTATUS[0]}"
+        local attempt=0 rc=0
+        while true; do
+            rc=0
+            VLLM_LOGGING_LEVEL=INFO CUDA_VISIBLE_DEVICES="\$devs" python -u -m scripts.run_inference \\
+                --input "$INF_INPUT" \\
+                --model "$INF_MODEL" \\
+                --prompt-variant "$INF_PROMPT" \\
+                --method "$INF_METHOD" \\
+                --output-dir "$OUTPUT_DIR" \\
+                --shard "\$i" --num-shards $INF_DP \\
+                --temperature "$INF_TEMPERATURE" \\
+                --top-p "$INF_TOP_P" \\
+                --top-k "$INF_TOP_K" \\
+                --max-tokens "$INF_MAX_TOKENS" \\
+                --tp $INF_TP \\
+                --gpu-util "$INF_GPU_UTIL" \\
+                --max-model-len "$INF_MAX_MODEL_LEN" \\
+                --max-num-seqs "$INF_MAX_NUM_SEQS" \\
+                --max-pixels "$INF_MAX_PIXELS" \\
+                --min-pixels "$INF_MIN_PIXELS" \\
+                --chunk-size "$INF_CHUNK_SIZE" \\
+                $ENFORCE_EAGER_FLAG \\
+                $BASE_MODEL_FLAG \\
+                $IMAGE_ROOT_FLAG \\
+                $METHOD_FLAGS \\
+                $MAX_EXAMPLES_FLAG \\
+                --resume \\
+                --restart-every $INF_RESTART_EVERY \\
+                2>> "${OUTPUT_DIR}/engine_debug_shard\${i}.log" | stdbuf -oL sed "s/^/[shard \$i] /" | tee -a "${OUTPUT_DIR}/shard\${i}.log" || rc=\$?
+            [ "\$rc" -eq 0 ] && return 0
+            attempt=\$((attempt + 1))
+            if [ "\$attempt" -ge $INF_MAX_RESTARTS ]; then
+                echo "[shard \$i] giving up after \$attempt restarts (rc=\$rc)" >&2
+                return "\$rc"
+            fi
+            echo "[shard \$i] crashed (rc=\$rc) — relaunching with --resume (\$attempt/$INF_MAX_RESTARTS)" >&2
+            sleep 20
+        done
     }
 
     need=\$(( $INF_DP * $INF_TP ))
@@ -401,30 +433,42 @@ if [[ "$INF_DP" -gt 1 ]]; then
     cat "${OUTPUT_DIR}"/*_samples_shard*.jsonl > "${OUTPUT_DIR}/${RUN_ID}_samples.jsonl"
     echo "[info] Merged \$(wc -l < "${OUTPUT_DIR}/${RUN_ID}_samples.jsonl") samples"
 else
-    python -m scripts.run_inference \\
-        --input "$INF_INPUT" \\
-        --model "$INF_MODEL" \\
-        --prompt-variant "$INF_PROMPT" \\
-        --method "$INF_METHOD" \\
-        --output-dir "$OUTPUT_DIR" \\
-        --temperature "$INF_TEMPERATURE" \\
-        --top-p "$INF_TOP_P" \\
-        --top-k "$INF_TOP_K" \\
-        --max-tokens "$INF_MAX_TOKENS" \\
-        --tp "$INF_TP" \\
-        --gpu-util "$INF_GPU_UTIL" \\
-        --max-model-len "$INF_MAX_MODEL_LEN" \\
-        --max-num-seqs "$INF_MAX_NUM_SEQS" \\
-        --max-pixels "$INF_MAX_PIXELS" \\
-        --min-pixels "$INF_MIN_PIXELS" \\
-        --chunk-size "$INF_CHUNK_SIZE" \\
-        $ENFORCE_EAGER_FLAG \\
-        $BASE_MODEL_FLAG \\
-        $IMAGE_ROOT_FLAG \\
-        $METHOD_FLAGS \\
-        $MAX_EXAMPLES_FLAG \\
-        $RESUME_FLAG \\
-        --restart-every $INF_RESTART_EVERY
+    attempt=0
+    while true; do
+        rc=0
+        VLLM_LOGGING_LEVEL=INFO python -m scripts.run_inference \\
+            --input "$INF_INPUT" \\
+            --model "$INF_MODEL" \\
+            --prompt-variant "$INF_PROMPT" \\
+            --method "$INF_METHOD" \\
+            --output-dir "$OUTPUT_DIR" \\
+            --temperature "$INF_TEMPERATURE" \\
+            --top-p "$INF_TOP_P" \\
+            --top-k "$INF_TOP_K" \\
+            --max-tokens "$INF_MAX_TOKENS" \\
+            --tp "$INF_TP" \\
+            --gpu-util "$INF_GPU_UTIL" \\
+            --max-model-len "$INF_MAX_MODEL_LEN" \\
+            --max-num-seqs "$INF_MAX_NUM_SEQS" \\
+            --max-pixels "$INF_MAX_PIXELS" \\
+            --min-pixels "$INF_MIN_PIXELS" \\
+            --chunk-size "$INF_CHUNK_SIZE" \\
+            $ENFORCE_EAGER_FLAG \\
+            $BASE_MODEL_FLAG \\
+            $IMAGE_ROOT_FLAG \\
+            $METHOD_FLAGS \\
+            $MAX_EXAMPLES_FLAG \\
+            --resume \\
+            --restart-every $INF_RESTART_EVERY 2>> "$OUTPUT_DIR/engine_debug.log" || rc=\$?
+        [ "\$rc" -eq 0 ] && break
+        attempt=\$((attempt + 1))
+        if [ "\$attempt" -ge $INF_MAX_RESTARTS ]; then
+            echo "[error] inference giving up after \$attempt restarts (rc=\$rc)" >&2
+            exit "\$rc"
+        fi
+        echo "[warn] inference crashed (rc=\$rc) — relaunching with --resume (\$attempt/$INF_MAX_RESTARTS)" >&2
+        sleep 20
+    done
 fi
 JOB1EOF
 
@@ -530,6 +574,16 @@ export CC=gcc
 export CXX=g++
 export OMP_NUM_THREADS=1
 
+# Curb host-RSS bloat in the image-decoding parent process.  glibc creates
+# up to 8×ncores malloc arenas; with a 16-thread decode pool on a 32-core
+# allocation that fragmentation alone can cost tens of GB of RSS.  Capping
+# arenas and forcing trim returns freed memory to the OS promptly — directly
+# relevant when the job is host-RAM bound rather than GPU bound.
+export MALLOC_ARENA_MAX=2
+export MALLOC_TRIM_THRESHOLD_=0
+# Reduce GPU allocator fragmentation across periodic engine restarts.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 # -----------------------------------------------------------------------
 # Load cluster-specific environment (HF_HOME, offline mode, etc.)
 # -----------------------------------------------------------------------
@@ -579,39 +633,58 @@ if [[ "$INF_DP" -gt 1 ]]; then
     mkdir -p "\${OUTPUT_DIR}"
     echo "[info] Output dir: \${OUTPUT_DIR}"
 
+    ( while true; do
+        ts=\$(date +%H:%M:%S)
+        gpu=\$(nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null | paste -sd';' -)
+        host=\$(free -g | awk '/^Mem:/{printf "used=%sG free=%sG", \$3, \$4}')
+        echo "\$ts | host \$host | gpu[idx,used,total] \$gpu"
+        sleep 60
+      done ) > "\${OUTPUT_DIR}/mem_timeline.log" 2>&1 &
+
     # Index into whatever GPUs SLURM actually gave us
     IFS=',' read -ra ALLOC_GPUS <<< "\${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 
     run_shard() {
         local i="\$1" devs="\$2"
-        CUDA_VISIBLE_DEVICES="\$devs" python -u -m scripts.run_inference \\
-            --input "$INF_INPUT" \\
-            --model "$INF_MODEL" \\
-            --prompt-variant "$INF_PROMPT" \\
-            --method "$INF_METHOD" \\
-            --output-dir "\${OUTPUT_DIR}" \\
-            --shard "\$i" --num-shards $INF_DP \\
-            --temperature "$INF_TEMPERATURE" \\
-            --top-p "$INF_TOP_P" \\
-            --top-k "$INF_TOP_K" \\
-            --max-tokens "$INF_MAX_TOKENS" \\
-            --tp $INF_TP \\
-            --gpu-util "$INF_GPU_UTIL" \\
-            --max-model-len "$INF_MAX_MODEL_LEN" \\
-            --max-num-seqs "$INF_MAX_NUM_SEQS" \\
-            --max-pixels "$INF_MAX_PIXELS" \\
-            --min-pixels "$INF_MIN_PIXELS" \\
-            --chunk-size "$INF_CHUNK_SIZE" \\
-            $ENFORCE_EAGER_FLAG \\
-            $BASE_MODEL_FLAG \\
-            $IMAGE_ROOT_FLAG \\
-            \$([ "$INF_METHOD" = "naive-sampling" ] && echo "--samples-per-example $INF_SAMPLES_PER_EXAMPLE") \\
-            \$([ "$INF_METHOD" = "iterative" ] && echo "--attempts-per-round $INF_ATTEMPTS_PER_ROUND --max-rounds $INF_MAX_ROUNDS --enable-feedback $INF_FEEDBACK --max-feedback-chars $INF_MAX_FEEDBACK_CHARS") \\
-            $MAX_EXAMPLES_FLAG \\
-            $RESUME_FLAG \\
-            --restart-every $INF_RESTART_EVERY \\
-            2>&1 | stdbuf -oL sed "s/^/[shard \$i] /" | tee "\${OUTPUT_DIR}/shard\${i}.log"
-        return "\${PIPESTATUS[0]}"
+        local attempt=0 rc=0
+        while true; do
+            rc=0
+            VLLM_LOGGING_LEVEL=INFO CUDA_VISIBLE_DEVICES="\$devs" python -u -m scripts.run_inference \\
+                --input "$INF_INPUT" \\
+                --model "$INF_MODEL" \\
+                --prompt-variant "$INF_PROMPT" \\
+                --method "$INF_METHOD" \\
+                --output-dir "\${OUTPUT_DIR}" \\
+                --shard "\$i" --num-shards $INF_DP \\
+                --temperature "$INF_TEMPERATURE" \\
+                --top-p "$INF_TOP_P" \\
+                --top-k "$INF_TOP_K" \\
+                --max-tokens "$INF_MAX_TOKENS" \\
+                --tp $INF_TP \\
+                --gpu-util "$INF_GPU_UTIL" \\
+                --max-model-len "$INF_MAX_MODEL_LEN" \\
+                --max-num-seqs "$INF_MAX_NUM_SEQS" \\
+                --max-pixels "$INF_MAX_PIXELS" \\
+                --min-pixels "$INF_MIN_PIXELS" \\
+                --chunk-size "$INF_CHUNK_SIZE" \\
+                $ENFORCE_EAGER_FLAG \\
+                $BASE_MODEL_FLAG \\
+                $IMAGE_ROOT_FLAG \\
+                \$([ "$INF_METHOD" = "naive-sampling" ] && echo "--samples-per-example $INF_SAMPLES_PER_EXAMPLE") \\
+                \$([ "$INF_METHOD" = "iterative" ] && echo "--attempts-per-round $INF_ATTEMPTS_PER_ROUND --max-rounds $INF_MAX_ROUNDS --enable-feedback $INF_FEEDBACK --max-feedback-chars $INF_MAX_FEEDBACK_CHARS") \\
+                $MAX_EXAMPLES_FLAG \\
+                --resume \\
+                --restart-every $INF_RESTART_EVERY \\
+                2>> "\${OUTPUT_DIR}/engine_debug_shard\${i}.log" | stdbuf -oL sed "s/^/[shard \$i] /" | tee -a "\${OUTPUT_DIR}/shard\${i}.log" || rc=\$?
+            [ "\$rc" -eq 0 ] && return 0
+            attempt=\$((attempt + 1))
+            if [ "\$attempt" -ge $INF_MAX_RESTARTS ]; then
+                echo "[shard \$i] giving up after \$attempt restarts (rc=\$rc)" >&2
+                return "\$rc"
+            fi
+            echo "[shard \$i] crashed (rc=\$rc) — relaunching with --resume (\$attempt/$INF_MAX_RESTARTS)" >&2
+            sleep 20
+        done
     }
 
     need=\$(( $INF_DP * $INF_TP ))
@@ -645,33 +718,65 @@ if [[ "$INF_DP" -gt 1 ]]; then
     echo "[info] Merged \$(wc -l < "\${SAMPLES}") samples into \${SAMPLES}"
 else
     # ── Single-process path (honours --tp for large models) ─────────
-    python -m scripts.run_inference \\
-        --input "$INF_INPUT" \\
-        --model "$INF_MODEL" \\
-        --prompt-variant "$INF_PROMPT" \\
-        --method "$INF_METHOD" \\
-        --temperature "$INF_TEMPERATURE" \\
-        --top-p "$INF_TOP_P" \\
-        --top-k "$INF_TOP_K" \\
-        --max-tokens "$INF_MAX_TOKENS" \\
-        --tp "$INF_TP" \\
-        --gpu-util "$INF_GPU_UTIL" \\
-        --max-model-len "$INF_MAX_MODEL_LEN" \\
-        --max-num-seqs "$INF_MAX_NUM_SEQS" \\
-        --max-pixels "$INF_MAX_PIXELS" \\
-        --min-pixels "$INF_MIN_PIXELS" \\
-        --chunk-size "$INF_CHUNK_SIZE" \\
-        $ENFORCE_EAGER_FLAG \\
-        $BASE_MODEL_FLAG \\
-        $OUTPUT_DIR_FLAG \\
-        \$([ "$INF_METHOD" = "naive-sampling" ] && echo "--samples-per-example $INF_SAMPLES_PER_EXAMPLE") \\
-        \$([ "$INF_METHOD" = "iterative" ] && echo "--attempts-per-round $INF_ATTEMPTS_PER_ROUND --max-rounds $INF_MAX_ROUNDS --enable-feedback $INF_FEEDBACK --max-feedback-chars $INF_MAX_FEEDBACK_CHARS") \\
-        $MAX_EXAMPLES_FLAG \\
-        $RESUME_FLAG \\
-        --restart-every $INF_RESTART_EVERY
+    # Pin the output dir here (instead of letting run_inference.py
+    # auto-generate one) so crash restarts with --resume land in the
+    # same directory and skip completed examples.
+    if [[ -n "$INF_OUTPUT_DIR" ]]; then
+        OUTPUT_DIR="$INF_OUTPUT_DIR"
+        RUN_ID=\$(basename "\${OUTPUT_DIR}")
+    else
+        RUN_ID="\$(date +%Y%m%d_%H%M%S)_\$(printf '%06d' \$((RANDOM * RANDOM % 1000000)))"
+        OUTPUT_DIR="logs/schedule/oven_${INF_METHOD}_${INF_PROMPT}/\${MODEL_SLUG}/\${RUN_ID}"
+    fi
+    mkdir -p "\${OUTPUT_DIR}"
+    echo "[info] Output dir: \${OUTPUT_DIR}"
 
-    EXPERIMENT_DIR="logs/schedule/oven_${INF_METHOD}_${INF_PROMPT}/\${MODEL_SLUG}"
-    OUTPUT_DIR=\$(ls -1d "\${EXPERIMENT_DIR}"/20* 2>/dev/null | sort | tail -1)
+    ( while true; do
+        ts=\$(date +%H:%M:%S)
+        gpu=\$(nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null | paste -sd';' -)
+        host=\$(free -g | awk '/^Mem:/{printf "used=%sG free=%sG", \$3, \$4}')
+        echo "\$ts | host \$host | gpu[idx,used,total] \$gpu"
+        sleep 60
+      done ) > "\${OUTPUT_DIR}/mem_timeline.log" 2>&1 &
+
+    attempt=0
+    while true; do
+        rc=0
+        VLLM_LOGGING_LEVEL=INFO python -m scripts.run_inference \\
+            --input "$INF_INPUT" \\
+            --model "$INF_MODEL" \\
+            --prompt-variant "$INF_PROMPT" \\
+            --method "$INF_METHOD" \\
+            --output-dir "\${OUTPUT_DIR}" \\
+            --temperature "$INF_TEMPERATURE" \\
+            --top-p "$INF_TOP_P" \\
+            --top-k "$INF_TOP_K" \\
+            --max-tokens "$INF_MAX_TOKENS" \\
+            --tp "$INF_TP" \\
+            --gpu-util "$INF_GPU_UTIL" \\
+            --max-model-len "$INF_MAX_MODEL_LEN" \\
+            --max-num-seqs "$INF_MAX_NUM_SEQS" \\
+            --max-pixels "$INF_MAX_PIXELS" \\
+            --min-pixels "$INF_MIN_PIXELS" \\
+            --chunk-size "$INF_CHUNK_SIZE" \\
+            $ENFORCE_EAGER_FLAG \\
+            $BASE_MODEL_FLAG \\
+            $IMAGE_ROOT_FLAG \\
+            \$([ "$INF_METHOD" = "naive-sampling" ] && echo "--samples-per-example $INF_SAMPLES_PER_EXAMPLE") \\
+            \$([ "$INF_METHOD" = "iterative" ] && echo "--attempts-per-round $INF_ATTEMPTS_PER_ROUND --max-rounds $INF_MAX_ROUNDS --enable-feedback $INF_FEEDBACK --max-feedback-chars $INF_MAX_FEEDBACK_CHARS") \\
+            $MAX_EXAMPLES_FLAG \\
+            --resume \\
+            --restart-every $INF_RESTART_EVERY 2>> "\${OUTPUT_DIR}/engine_debug.log" || rc=\$?
+        [ "\$rc" -eq 0 ] && break
+        attempt=\$((attempt + 1))
+        if [ "\$attempt" -ge $INF_MAX_RESTARTS ]; then
+            echo "[error] inference giving up after \$attempt restarts (rc=\$rc)" >&2
+            exit "\$rc"
+        fi
+        echo "[warn] inference crashed (rc=\$rc) — relaunching with --resume (\$attempt/$INF_MAX_RESTARTS)" >&2
+        sleep 20
+    done
+
     SAMPLES=\$(ls -1 "\${OUTPUT_DIR}"/*_samples.jsonl 2>/dev/null | head -1)
 fi
 
