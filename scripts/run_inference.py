@@ -519,6 +519,9 @@ def main():
             max_num_seqs=args.max_num_seqs,
             enable_prefix_caching=True,
             enforce_eager=args.enforce_eager,
+            # TP>1 with CUDA graphs can hit custom_all_reduce.cuh crashes
+            # on some A100 topologies. Falls back to NCCL all-reduce.
+            disable_custom_all_reduce=(args.tp > 1),
             limit_mm_per_prompt={"image": 1},
             mm_processor_cache_gb=0,
             async_scheduling=args.async_scheduling,
