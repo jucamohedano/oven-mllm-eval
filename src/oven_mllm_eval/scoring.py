@@ -294,6 +294,10 @@ def score_generation_file(
     # Compute pass@k using the unbiased estimator from the Codex paper:
     #   pass@k = E[ 1 - C(n-c, k) / C(n, k) ]
     # where n = number of rollouts, c = number judged correct.
+    #
+    # When ``judge_verdicts_majority`` is present, a second set of pass@k
+    # values is computed from the majority-vote verdicts and published as
+    # ``pass@{k}_majority``.
     _judge_rows = [r for r in scored_rows if r.get("judge_verdicts")]
     if _judge_rows:
         from scipy.special import comb as _comb
@@ -304,16 +308,15 @@ def score_generation_file(
         _ks = sorted({k for k in _candidate_ks if 0 < k <= _n_max})
         _ks.append(_n_max)  # always include the full rollout count
 
+        # First-prediction pass@k (always available)
         _pass_at_k: dict[str, float] = {}
         for _k in _ks:
             _vals: list[float] = []
             for _n, r in zip(_ns, _judge_rows):
                 _c = sum(r["judge_verdicts"])
                 if _n < _k:
-                    # Not enough samples for this k — pass if any correct.
                     _vals.append(1.0 if _c > 0 else 0.0)
                 elif _n - _c < _k:
-                    # C(n-c, k) = 0 when n-c < k — at least one correct is guaranteed.
                     _vals.append(1.0)
                 else:
                     _vals.append(
@@ -323,9 +326,47 @@ def score_generation_file(
                     )
             _pass_at_k[f"pass@{_k}"] = sum(_vals) / len(_vals)
 
+        # Majority-vote pass@k (extra, when available from free-form judge n>1)
+        if any(r.get("judge_verdicts_majority") for r in _judge_rows):
+            for _k in _ks:
+                _vals: list[float] = []
+                for _n, r in zip(_ns, _judge_rows):
+                    _mv = r.get("judge_verdicts_majority")
+                    if _mv is None:
+                        # Example not voted (e.g. empty all_texts) — skip
+                        continue
+                    _c = sum(_mv)
+                    if _n < _k:
+                        _vals.append(1.0 if _c > 0 else 0.0)
+                    elif _n - _c < _k:
+                        _vals.append(1.0)
+                    else:
+                        _vals.append(
+                            1.0
+                            - float(_comb(_n - _c, _k, exact=True))
+                            / float(_comb(_n, _k, exact=True))
+                        )
+                if _vals:
+                    _pass_at_k[f"pass@{_k}_majority"] = sum(_vals) / len(_vals)
+
         # Attach pass@k to each measure's summary
         for _s in summaries:
             _s["metrics"].update(_pass_at_k)
+
+    # ── Judge parse stats ──────────────────────────────────────────
+    # Count rollouts where the judge produced no parseable output
+    # (judge_parse_ok=False) so users can gauge free-form reliability.
+    _judge_unparseable = 0
+    _judge_rollouts = 0
+    for _r in scored_rows:
+        _ok = _r.get("judge_parse_ok")
+        if _ok is not None:
+            _judge_rollouts += len(_ok)
+            _judge_unparseable += sum(1 for ok in _ok if not ok)
+    if _judge_rollouts:
+        for _s in summaries:
+            _s["metrics"]["num_judge_unparseable"] = _judge_unparseable
+            _s["metrics"]["num_judge_rollouts"] = _judge_rollouts
 
     # Drop stale unprefixed keys from old scoring runs so rows stay clean
     _STALE_KEYS = {"scored_predicted_node", "scored_predicted_path",

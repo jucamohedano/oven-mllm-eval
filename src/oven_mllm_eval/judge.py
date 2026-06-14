@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 # ---------------------------------------------------------------------------
 # JSON schema for guided decoding
@@ -89,3 +90,66 @@ def parse_judge_output(output_text: str) -> tuple[bool, str]:
         raise JudgeParseError(f"reason missing or empty, got {reason_raw!r}")
 
     return verdict_raw == "yes", reason_raw.strip()
+
+
+# ---------------------------------------------------------------------------
+# Free-form prompt (no CoT, no reason — adapted from answer-matching)
+# ---------------------------------------------------------------------------
+
+
+def build_judge_prompt_free_form(
+    question: str, ground_truth: str, rollout_text: str
+) -> str:
+    """Build a free-form judge prompt for OVEN entity matching.
+
+    No chain-of-thought, no post-hoc reason.  The model outputs ``0`` or ``1``
+    inside ``<answer>…</answer>`` tags.
+
+    The prompt is intentionally neutral about specificity: the question
+    already encodes the expected granularity (e.g. "what breed is this?"
+    vs "what type of animal is this?"), so the judge only needs to check
+    whether the response and ground truth refer to the same entity.
+    """
+    return (
+        "Your task is to judge whether the given response to a question "
+        "matches a given ground truth answer or not. You are provided with "
+        "a question, a ground truth answer, and the response you need to "
+        "judge.\n\n"
+        "The response matches the ground truth if both are semantically "
+        "equivalent — they refer to the same entity at the level of "
+        "specificity asked by the question.\n\n"
+        "Possible judgments:\n\n"
+        '"0": The response does not match the ground-truth answer.\n'
+        '"1": The response matches the ground-truth.\n\n'
+        f'Question: "{question}"\n'
+        f'Ground truth: "{ground_truth}"\n'
+        f'Response: "{rollout_text}"\n\n'
+        "Your job is to ONLY check whether the given response matches "
+        "the ground truth answer or not in the context of the question. "
+        "You DO NOT NEED to assess the correctness of the response. "
+        "This is part of an automated evaluation process, therefore you "
+        "MUST OUTPUT your final answer as \"0\" or \"1\" in "
+        "<answer> </answer> tags.\n"
+        "YOU SHOULD ALWAYS END YOUR RESPONSE WITH <answer>0</answer> OR "
+        "<answer>1</answer> TAGS."
+    )
+
+
+def parse_free_form_output(output_text: str) -> tuple[bool, str]:
+    """Parse a free-form judge output.
+
+    Extracts the verdict from ``<answer>0</answer>`` or
+    ``<answer>1</answer>`` tags.  Takes the **last** occurrence (in case the
+    model emits text after a preliminary answer).
+
+    Returns
+    -------
+    (verdict, matched_digit)
+        ``verdict`` is ``True`` for ``"1"``, ``False`` for ``"0"``.
+        ``matched_digit`` is ``"0"`` or ``"1"`` (or ``""`` if no tag found).
+    """
+    matches = list(re.finditer(r"<answer>\s*(\d)\s*</answer>", output_text))
+    if matches:
+        digit = matches[-1].group(1)  # last occurrence
+        return digit == "1", digit
+    return False, ""
