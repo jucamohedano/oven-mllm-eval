@@ -44,6 +44,13 @@ Judge options:
     --judge-max-model-len <LEN>   Judge max context length (default: 2048)
     --judge-max-num-seqs <N>      Judge max concurrent sequences (default: 1024)
     --judge-gpu-util <UTIL>       Judge GPU memory utilization (default: 0.92)
+    --judge-mode <MODE>           Judging mode: structured or free-form (default: structured)
+    --judge-n <N>                 Generations per judge prompt — n>1 enables majority
+                                  voting (default: 1)
+    --judge-temperature <TEMP>    Judge temperature — set >0 for majority voting to
+                                  get diverse completions (default: 0.0)
+    --judge-top-p <P>             Judge top-p (nucleus) — free-form only (default: 1.0)
+    --judge-top-k <K>             Judge top-k — free-form only, -1=disabled (default: -1)
 
 Scoring options:
     --input <PATH>                Input samples JSONL (required)
@@ -79,6 +86,11 @@ INF_JUDGE_GPUS="1"
 INF_JUDGE_MAX_MODEL_LEN="2048"
 INF_JUDGE_MAX_NUM_SEQS="1024"
 INF_JUDGE_GPU_UTIL="0.92"
+INF_JUDGE_MODE="structured"
+INF_JUDGE_N="1"
+INF_JUDGE_TEMPERATURE="0.0"
+INF_JUDGE_TOP_P="1.0"
+INF_JUDGE_TOP_K="-1"
 
 # Scoring
 SCORING_INPUT=""
@@ -114,6 +126,11 @@ main() {
             --judge-max-model-len) INF_JUDGE_MAX_MODEL_LEN="$2"; shift 2 ;;
             --judge-max-num-seqs)  INF_JUDGE_MAX_NUM_SEQS="$2"; shift 2 ;;
             --judge-gpu-util)   INF_JUDGE_GPU_UTIL="$2"; shift 2 ;;
+            --judge-mode)       INF_JUDGE_MODE="$2"; shift 2 ;;
+            --judge-n)          INF_JUDGE_N="$2"; shift 2 ;;
+            --judge-temperature) INF_JUDGE_TEMPERATURE="$2"; shift 2 ;;
+            --judge-top-p)      INF_JUDGE_TOP_P="$2"; shift 2 ;;
+            --judge-top-k)      INF_JUDGE_TOP_K="$2"; shift 2 ;;
             *) echo "Error: unknown option: $1" >&2; exit 1 ;;
         esac
     done
@@ -155,7 +172,10 @@ main() {
         if [[ "$SLURM_MEM" == "30G" ]]; then
             SLURM_MEM="64G"
         fi
-        if [[ $INF_JUDGE_GPUS -gt 1 ]]; then
+        # NB: do NOT use $( [[ ... ]] && echo s ) here — under `set -e` the
+        # failing test (when GPUS=1) makes the command-sub return non-zero,
+        # which aborts the assignment and kills the script before submit.
+        if [[ "$INF_JUDGE_GPUS" -gt 1 ]]; then
             JOB_TYPE="$INF_JUDGE_GPUS GPUs (judge + score)"
         else
             JOB_TYPE="1 GPU (judge + score)"
@@ -181,6 +201,7 @@ main() {
     echo "  Workers:      $SCORING_NUM_WORKERS"
     if [[ -n "$INF_JUDGE_MODEL" ]]; then
         echo "  Judge model:  $INF_JUDGE_MODEL  (GPUs=$INF_JUDGE_GPUS)"
+        echo "  Judge mode:   $INF_JUDGE_MODE  (n=$INF_JUDGE_N, temp=$INF_JUDGE_TEMPERATURE, top_p=$INF_JUDGE_TOP_P, top_k=$INF_JUDGE_TOP_K)"
     fi
     echo "  Partition:    $SLURM_PARTITION"
     echo "  CPUs:         $SLURM_CPUS"
@@ -232,21 +253,33 @@ if [[ -n "$INF_JUDGE_MODEL" ]]; then
             --input "\$SAMPLES" \\
             --output "\$JUDGED" \\
             --judge-model "$INF_JUDGE_MODEL" \\
+            --judge-mode "$INF_JUDGE_MODE" \\
+            --judge-n "$INF_JUDGE_N" \\
+            --judge-temperature "$INF_JUDGE_TEMPERATURE" \\
+            --judge-top-p "$INF_JUDGE_TOP_P" \\
+            --judge-top-k "$INF_JUDGE_TOP_K" \\
             --max-model-len "$INF_JUDGE_MAX_MODEL_LEN" \\
             --max-num-seqs "$INF_JUDGE_MAX_NUM_SEQS" \\
             --gpu-util "$INF_JUDGE_GPU_UTIL"
     else
-        echo "[info] Splitting input across $INF_JUDGE_GPUS GPUs..."
-        TMPD=\$(mktemp -d)
-        split -n l/$INF_JUDGE_GPUS "\$SAMPLES" "\$TMPD/shard_"
+        # ── Durable data-parallel judge (strided sharding) ────────
+        # Each GPU processes examples[shard::num_shards] and writes to a
+        # persistent _shard{N}.jsonl file.  Crashes preserve per-shard
+        # progress.  GPU-count changes work: run_judge.py reads ALL
+        # _shard*.jsonl files for a global resume set.
+        echo "[info] Launching $INF_JUDGE_GPUS judge shards (strided)..."
         pids=()
         for i in \$(seq 0 $((INF_JUDGE_GPUS - 1))); do
-            SHARD_IN=\$(ls "\$TMPD"/shard_* | sed -n "\$((i+1))p")
-            SHARD_OUT="\$TMPD/judged_shard_\${i}.jsonl"
             CUDA_VISIBLE_DEVICES=\$i python -m scripts.run_judge \\
-                --input "\$SHARD_IN" \\
-                --output "\$SHARD_OUT" \\
+                --input "\$SAMPLES" \\
+                --output "\$JUDGED" \\
+                --shard \$i --num-shards $INF_JUDGE_GPUS \\
                 --judge-model "$INF_JUDGE_MODEL" \\
+                --judge-mode "$INF_JUDGE_MODE" \\
+                --judge-n "$INF_JUDGE_N" \\
+                --judge-temperature "$INF_JUDGE_TEMPERATURE" \\
+                --judge-top-p "$INF_JUDGE_TOP_P" \\
+                --judge-top-k "$INF_JUDGE_TOP_K" \\
                 --max-model-len "$INF_JUDGE_MAX_MODEL_LEN" \\
                 --max-num-seqs "$INF_JUDGE_MAX_NUM_SEQS" \\
                 --gpu-util "$INF_JUDGE_GPU_UTIL" &
@@ -257,8 +290,12 @@ if [[ -n "$INF_JUDGE_MODEL" ]]; then
         if [[ \$fail -ne 0 ]]; then
             echo "[error] a judge shard failed" >&2; exit 1
         fi
-        cat "\$TMPD"/judged_shard_*.jsonl > "\$JUDGED"
-        rm -rf "\$TMPD"
+        # Merge persistent shard outputs into the final judged file.
+        shards=(\$(ls "\${JUDGED}"_shard*.jsonl 2>/dev/null | sort))
+        if [[ \${#shards[@]} -gt 0 ]]; then
+            cat "\${shards[@]}" > "\$JUDGED"
+            echo "[judge] merged \${#shards[@]} shards → \$(wc -l < "\$JUDGED") rows"
+        fi
     fi
     SAMPLES="\$JUDGED"
 fi
@@ -270,6 +307,16 @@ python -m scripts.score_predictions \\
     --taxonomy-index "$SCORING_TAXONOMY_INDEX" \\
     --measure $SCORING_MEASURE \\
     --num-workers $SCORING_NUM_WORKERS
+
+# Clean up intermediate shard files only if scoring succeeded
+if [[ -s "$SCORING_OUTPUT" ]]; then
+    shard_dir="\$(dirname "\$SAMPLES")"
+    rm -f "\${shard_dir}"/*_shard*.jsonl \
+          "\${shard_dir}"/shard*.log \
+          "\${shard_dir}"/engine_debug_shard*.log \
+          "\${shard_dir}"/mem_timeline.log
+    echo "[cleanup] removed intermediate shard files"
+fi
 
 echo "[info] Done. Output: $SCORING_OUTPUT"
 EOT

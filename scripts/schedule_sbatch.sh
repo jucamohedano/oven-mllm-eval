@@ -46,7 +46,15 @@ Scoring options:
                                   two-job pipeline with judge between inference and scoring.
     --judge-max-model-len <LEN>   Judge max context length (default: 2048)
     --judge-max-num-seqs <N>      Judge max concurrent sequences (default: 1024)
+    --judge-gpus <N>              Number of GPUs for judge (default: 1)
     --judge-gpu-util <UTIL>       Judge GPU memory utilization (default: 0.92)
+    --judge-mode <MODE>           Judging mode: structured or free-form (default: structured)
+    --judge-n <N>                 Generations per judge prompt — n>1 enables majority
+                                  voting (default: 1)
+    --judge-temperature <TEMP>    Judge temperature — set >0 for majority voting
+                                  (default: 0.0)
+    --judge-top-p <P>             Judge top-p (nucleus) — free-form only (default: 1.0)
+    --judge-top-k <K>             Judge top-k — free-form only, -1=disabled (default: -1)
     --scoring-measure <MEASURE>   Measure(s) for DirectMeasureMatcher: exact_match, contained, all
                                   (default: exact_match).  Space-separate for multiple.
     --scoring-workers <N>         Number of CPU workers for parallel scoring (default: 0 = auto)
@@ -129,9 +137,15 @@ INF_IMAGE_ROOT=""
 
 # Judge (text-only LM for verdicts; when set, runs after inference)
 INF_JUDGE_MODEL=""
-INF_JUDGE_MAX_MODEL_LEN="2048"
-INF_JUDGE_MAX_NUM_SEQS="1024"
+INF_JUDGE_GPUS="1"
+INF_JUDGE_MAX_MODEL_LEN="1024"
+INF_JUDGE_MAX_NUM_SEQS="2048"
 INF_JUDGE_GPU_UTIL="0.92"
+INF_JUDGE_MODE="structured"
+INF_JUDGE_N="1"
+INF_JUDGE_TEMPERATURE="0.0"
+INF_JUDGE_TOP_P="1.0"
+INF_JUDGE_TOP_K="-1"
 
 # Scoring
 SCORING_MEASURE="exact_match"
@@ -204,7 +218,13 @@ main() {
             --judge-model)     INF_JUDGE_MODEL="$2"; shift 2 ;;
             --judge-max-model-len) INF_JUDGE_MAX_MODEL_LEN="$2"; shift 2 ;;
             --judge-max-num-seqs)  INF_JUDGE_MAX_NUM_SEQS="$2"; shift 2 ;;
+            --judge-gpus)      INF_JUDGE_GPUS="$2"; shift 2 ;;
             --judge-gpu-util)   INF_JUDGE_GPU_UTIL="$2"; shift 2 ;;
+            --judge-mode)       INF_JUDGE_MODE="$2"; shift 2 ;;
+            --judge-n)          INF_JUDGE_N="$2"; shift 2 ;;
+            --judge-temperature) INF_JUDGE_TEMPERATURE="$2"; shift 2 ;;
+            --judge-top-p)      INF_JUDGE_TOP_P="$2"; shift 2 ;;
+            --judge-top-k)      INF_JUDGE_TOP_K="$2"; shift 2 ;;
             *) echo "Error: unknown option: $1" >&2; exit 1 ;;
         esac
     done
@@ -287,7 +307,8 @@ main() {
     echo "  GPUs:         $SLURM_GPUS  (TP=$INF_TP, DP=$INF_DP)"
     echo "  Max pixels:   $INF_MAX_PIXELS"
     echo "  Base model:   $INF_BASE_MODEL"
-    echo "  Judge model:  ${INF_JUDGE_MODEL:-none}  (max_len=$INF_JUDGE_MAX_MODEL_LEN, seqs=$INF_JUDGE_MAX_NUM_SEQS, gpu=$INF_JUDGE_GPU_UTIL)"
+    echo "  Judge model:  ${INF_JUDGE_MODEL:-none}  (GPUs=$INF_JUDGE_GPUS, mode=$INF_JUDGE_MODE, n=$INF_JUDGE_N, temp=$INF_JUDGE_TEMPERATURE, top_p=$INF_JUDGE_TOP_P, top_k=$INF_JUDGE_TOP_K)"
+    echo "                max_len=$INF_JUDGE_MAX_MODEL_LEN, seqs=$INF_JUDGE_MAX_NUM_SEQS, gpu=$INF_JUDGE_GPU_UTIL"
     echo "  Score with:   $SCORING_MEASURE  (workers=${INF_SCORING_WORKERS:-0})"
     echo ""
 
@@ -299,13 +320,19 @@ main() {
         # parser bug that corrupts backslash line continuations.
         # ═══════════════════════════════════════════════════════════════
 
-        MODEL_SLUG="$(echo "$INF_MODEL" | tr '/' '_' | tr '[:upper:]' '[:lower:]')"
-        RUN_ID="$(date +%Y%m%d_%H%M%S)_$(printf '%06d' $((RANDOM * RANDOM % 1000000)))"
-        OUTPUT_DIR="logs/schedule/oven_${INF_METHOD}_${INF_PROMPT}/${MODEL_SLUG}/${RUN_ID}"
+        if [[ -n "$INF_OUTPUT_DIR" ]]; then
+            OUTPUT_DIR="$INF_OUTPUT_DIR"
+            RUN_ID="$(basename "$OUTPUT_DIR")"
+        else
+            MODEL_SLUG="$(echo "$INF_MODEL" | tr '/' '_' | tr '[:upper:]' '[:lower:]')"
+            RUN_ID="$(date +%Y%m%d_%H%M%S)_$(printf '%06d' $((RANDOM * RANDOM % 1000000)))"
+            OUTPUT_DIR="logs/schedule/oven_${INF_METHOD}_${INF_PROMPT}/${MODEL_SLUG}/${RUN_ID}"
+        fi
         mkdir -p "$OUTPUT_DIR"
 
         TMPDIR=$(mktemp -d -p "$OUTPUT_DIR" .sbatch.XXXXXX)
-        trap "rm -rf $TMPDIR" EXIT
+        _launcher_cleanup() { local rc=$?; rm -rf "$TMPDIR"; exit $rc; }
+        trap _launcher_cleanup EXIT
 
         # ── Job 1: Inference ──────────────────────────────────────
         cat > "$TMPDIR/job1.sh" << JOB1EOF
@@ -323,12 +350,14 @@ $SLURM_ACCOUNT_DIRECTIVE
 #SBATCH --time=$SLURM_TIME
 
 set -euo pipefail
-trap 'kill 0' EXIT
+_cleanup() { local rc=\$?; trap '' TERM; kill 0 2>/dev/null; exit \$rc; }
+trap _cleanup EXIT
 cd "\$SLURM_SUBMIT_DIR"
 module load nvhpc/24.5 gcc/12.2.0
 export CC=gcc CXX=g++ OMP_NUM_THREADS=1
 export MALLOC_ARENA_MAX=2 MALLOC_TRIM_THRESHOLD_=0
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export SAFETENSORS_FAST_GPU=1             # GPU-accelerated safe tensor loading
 if [[ -f ".env" ]]; then set -a; source .env; set +a; fi
 source .venv/bin/activate
 
@@ -483,12 +512,13 @@ $SLURM_ACCOUNT_DIRECTIVE
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=$SLURM_CPUS
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:$INF_JUDGE_GPUS
 #SBATCH --mem=$SLURM_MEM
 #SBATCH --time=$SLURM_TIME
 
 set -euo pipefail
-trap 'kill 0' EXIT
+_cleanup() { local rc=\$?; trap '' TERM; kill 0 2>/dev/null; exit \$rc; }
+trap _cleanup EXIT
 cd "\$SLURM_SUBMIT_DIR"
 module load nvhpc/24.5 gcc/12.2.0
 export CC=gcc CXX=g++ OMP_NUM_THREADS=1
@@ -503,15 +533,51 @@ if [[ ! -s "\${SAMPLES}" ]]; then
     exit 1
 fi
 
-echo "[info] Judging \${SAMPLES}..."
 JUDGED="${OUTPUT_DIR}/${RUN_ID}_judged.jsonl"
-CUDA_VISIBLE_DEVICES=0 python -m scripts.run_judge \\
-    --input "\${SAMPLES}" \\
-    --output "\${JUDGED}" \\
-    --judge-model "$INF_JUDGE_MODEL" \\
-    --max-model-len "$INF_JUDGE_MAX_MODEL_LEN" \\
-    --max-num-seqs "$INF_JUDGE_MAX_NUM_SEQS" \\
-    --gpu-util "$INF_JUDGE_GPU_UTIL"
+if [[ "$INF_JUDGE_GPUS" -le 1 ]]; then
+    echo "[info] Judging \${SAMPLES} (1 GPU)..."
+    CUDA_VISIBLE_DEVICES=0 python -m scripts.run_judge \\
+        --input "\${SAMPLES}" \\
+        --output "\${JUDGED}" \\
+        --judge-model "$INF_JUDGE_MODEL" \\
+        --judge-mode "$INF_JUDGE_MODE" \\
+        --judge-n "$INF_JUDGE_N" \\
+        --judge-temperature "$INF_JUDGE_TEMPERATURE" \\
+        --judge-top-p "$INF_JUDGE_TOP_P" \\
+        --judge-top-k "$INF_JUDGE_TOP_K" \\
+        --max-model-len "$INF_JUDGE_MAX_MODEL_LEN" \\
+        --max-num-seqs "$INF_JUDGE_MAX_NUM_SEQS" \\
+        --gpu-util "$INF_JUDGE_GPU_UTIL"
+else
+    echo "[info] Judging \${SAMPLES} ($INF_JUDGE_GPUS GPUs, strided)..."
+    pids=()
+    for i in \$(seq 0 $((INF_JUDGE_GPUS - 1))); do
+        CUDA_VISIBLE_DEVICES=\$i python -m scripts.run_judge \\
+            --input "\${SAMPLES}" \\
+            --output "\${JUDGED}" \\
+            --shard \$i --num-shards $INF_JUDGE_GPUS \\
+            --judge-model "$INF_JUDGE_MODEL" \\
+            --judge-mode "$INF_JUDGE_MODE" \\
+            --judge-n "$INF_JUDGE_N" \\
+            --judge-temperature "$INF_JUDGE_TEMPERATURE" \\
+            --judge-top-p "$INF_JUDGE_TOP_P" \\
+            --judge-top-k "$INF_JUDGE_TOP_K" \\
+            --max-model-len "$INF_JUDGE_MAX_MODEL_LEN" \\
+            --max-num-seqs "$INF_JUDGE_MAX_NUM_SEQS" \\
+            --gpu-util "$INF_JUDGE_GPU_UTIL" &
+        pids+=(\$!)
+    done
+    fail=0
+    for pid in "\${pids[@]}"; do wait "\$pid" || fail=1; done
+    if [[ \$fail -ne 0 ]]; then
+        echo "[error] a judge shard failed" >&2; exit 1
+    fi
+    shards=(\$(ls "\${JUDGED}"_shard*.jsonl 2>/dev/null | sort))
+    if [[ \${#shards[@]} -gt 0 ]]; then
+        cat "\${shards[@]}" > "\${JUDGED}"
+        echo "[judge] merged \${#shards[@]} shards → \$(wc -l < "\${JUDGED}") rows"
+    fi
+fi
 
 echo "[info] Scoring \${JUDGED}..."
 SCORED="${OUTPUT_DIR}/${RUN_ID}_scored.jsonl"
@@ -521,6 +587,15 @@ python -m scripts.score_predictions \\
     --taxonomy-index "$INF_TAXONOMY_INDEX" \\
     --measure $SCORING_MEASURE \\
     --num-workers $INF_SCORING_WORKERS
+
+# Clean up intermediate shard files only if scoring succeeded
+if [[ -s "${OUTPUT_DIR}/${RUN_ID}_scored.jsonl" ]]; then
+    rm -f "${OUTPUT_DIR}"/*_shard*.jsonl \
+          "${OUTPUT_DIR}"/shard*.log \
+          "${OUTPUT_DIR}"/engine_debug_shard*.log \
+          "${OUTPUT_DIR}"/mem_timeline.log
+    echo "[cleanup] removed intermediate shard files"
+fi
 
 echo "[info] Done. Output: ${OUTPUT_DIR}"
 JOB2EOF
@@ -534,6 +609,10 @@ JOB2EOF
         echo "[info] Job 1 (inference): $JOB1_ID"
 
         JOB2_ID=$(sbatch --parsable --dependency=afterok:$JOB1_ID "$TMPDIR/job2.sh")
+        if [[ -z "$JOB2_ID" ]]; then
+            echo "[error] Failed to submit Job 2 (judge+score)" >&2
+            exit 1
+        fi
         echo "[info] Job 2 (judge+score): $JOB2_ID  (waits for $JOB1_ID)"
         echo ""
         echo "  Output: $OUTPUT_DIR"
@@ -557,7 +636,8 @@ set -euo pipefail
 
 # Kill the entire process group on exit — prevents orphaned vLLM worker
 # processes from keeping the SLURM allocation alive after a crash.
-trap 'kill 0' EXIT
+_cleanup() { local rc=\$?; trap '' TERM; kill 0 2>/dev/null; exit \$rc; }
+trap _cleanup EXIT
 
 # -----------------------------------------------------------------------
 # Land in the submit directory
@@ -796,6 +876,15 @@ python -m scripts.score_predictions \\
     --taxonomy-index "$INF_TAXONOMY_INDEX" \\
     --measure $SCORING_MEASURE \\
     --num-workers $INF_SCORING_WORKERS
+
+# Clean up intermediate shard files only if scoring succeeded
+if [[ -s "\${SCORED_OUT}" ]]; then
+    rm -f "\${OUTPUT_DIR}"/*_shard*.jsonl \
+          "\${OUTPUT_DIR}"/shard*.log \
+          "\${OUTPUT_DIR}"/engine_debug_shard*.log \
+          "\${OUTPUT_DIR}"/mem_timeline.log
+    echo "[cleanup] removed intermediate shard files"
+fi
 
 echo "[info] Done."
 EOT
