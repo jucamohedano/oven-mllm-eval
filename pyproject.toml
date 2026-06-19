@@ -20,7 +20,7 @@ build-index = [
 serve = [
     # Replace with your cluster's vllm wheel path or use the PyPI package:
     #   "vllm>=0.11",
-    "vllm @ file:///leonardo_scratch/fast/<YOUR_ACCOUNT>/vllm_wheel/vllm-0.11.2-cp38-abi3-manylinux1_x86_64.whl",
+    #"vllm @ file:///leonardo_scratch/fast/<YOUR_ACCOUNT>/vllm_wheel/vllm-0.11.2-cp38-abi3-manylinux1_x86_64.whl",
 ]
 # For exploratory data analysis and plotting
 analysis = [
