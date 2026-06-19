@@ -338,6 +338,8 @@ def main():
     parser.add_argument("--image-root", default=None,
                         help="Root directory for resolving relative image_path. "
                              "Defaults to cwd.")
+    parser.add_argument("--no-image", action="store_true",
+                        help="Text-only baseline: skip image loading, send only the question.")
     parser.add_argument("--taxonomy-index", default="data/processed/oven_taxonomy_index.json",
                         help="Path to taxonomy index JSON")
     parser.add_argument("--output-dir", default=None,
@@ -451,35 +453,68 @@ def main():
     suffix = f"_shard{args.shard}" if args.num_shards > 1 else ""
     output_path = output_dir / f"{run_id}_samples{suffix}.jsonl"
 
-    # Resume support — filter before loading images
-    if args.resume and output_path.exists():
-        done_ids = set()
-        valid_lines: list[str] = []
-        n_bad = 0
-        with open(output_path, "r") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError:
-                    # A SIGKILL (e.g. cgroup OOM) mid-write can truncate the
-                    # final line.  Drop it so the example re-runs and
-                    # downstream readers (merge/judge/score) don't choke.
-                    n_bad += 1
-                    continue
-                valid_lines.append(line)
-                done_ids.add(row.get("data_id", row.get("image_id", "")))
-        if n_bad:
-            print(f"Resuming: dropping {n_bad} malformed line(s) from {output_path}")
-            tmp = output_path.with_name(output_path.name + ".tmp")
-            with open(tmp, "w") as f:
-                for line in valid_lines:
-                    f.write(line + "\n")
-            tmp.replace(output_path)
+    # Resume support — read ALL shard files for a global done set, then
+    # filter before loading images.  This allows a crashed DP shard to
+    # resume on a different GPU count (the remaining work is split across
+    # whatever --num-shards is currently set to).
+    if args.resume:
+        done_ids: set[str] = set()
+        # Collect IDs from every _shard*.jsonl file (global resume set)
+        for shard_file in sorted(output_dir.glob(f"{run_id}_samples_shard*.jsonl")):
+            if not shard_file.exists():
+                continue
+            with open(shard_file, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    done_ids.add(row.get("data_id", row.get("image_id", "")))
+        # Also read the non-sharded output (DP=1 path)
+        merged = output_dir / f"{run_id}_samples.jsonl"
+        if merged.exists():
+            with open(merged, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    done_ids.add(row.get("data_id", row.get("image_id", "")))
+
+        # Clean up truncated lines in THIS shard's file
+        if output_path.exists():
+            valid_lines: list[str] = []
+            n_bad = 0
+            with open(output_path, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        json.loads(line)
+                        valid_lines.append(line)
+                    except json.JSONDecodeError:
+                        n_bad += 1
+            if n_bad:
+                print(f"Resuming: dropping {n_bad} malformed line(s) from {output_path}")
+                tmp = output_path.with_name(output_path.name + ".tmp")
+                with open(tmp, "w") as f:
+                    for line in valid_lines:
+                        f.write(line + "\n")
+                tmp.replace(output_path)
+
         examples = [e for e in examples if e.get("data_id", e.get("image_id", "")) not in done_ids]
         print(f"Resuming: {len(done_ids)} already done, {len(examples)} remaining")
+
+    if not examples:
+        print("No examples to process — exiting.")
+        return
 
     # Resolve image paths — relative paths break when cwd != project root
     # (SLURM, DP shard processes).  Defaults to cwd; use --image-root to override.
@@ -490,13 +525,17 @@ def main():
     # buffers — which looks exactly like an engine "memory leak" and ends in
     # the cgroup OOM-killer SIGKILLing the EngineCore process.  Images are
     # now decoded per chunk inside the inference loop.
-    image_root = Path(args.image_root) if args.image_root else Path.cwd()
-    print(f"Resolving image paths... (root: {image_root})")
-    with ThreadPoolExecutor(max_workers=16) as pool:
-        resolved_paths = list(pool.map(
-            lambda p: _resolve_image_path(p, image_root),
-            [e.get("image_path", "") for e in examples],
-        ))
+    if args.no_image:
+        print("Text-only baseline — no images loaded.")
+        resolved_paths = ["" for _ in examples]
+    else:
+        image_root = Path(args.image_root) if args.image_root else Path.cwd()
+        print(f"Resolving image paths... (root: {image_root})")
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            resolved_paths = list(pool.map(
+                lambda p: _resolve_image_path(p, image_root),
+                [e.get("image_path", "") for e in examples],
+            ))
 
     # Build vLLM engine
     print(f"Initializing vLLM engine: model={args.model} tp={args.tp} max_model_len={args.max_model_len}")
@@ -587,6 +626,7 @@ def main():
             "max_examples": args.max_examples,
             "chunk_size": args.chunk_size,
             "resume": args.resume,
+            "no_image": args.no_image,
             "num_examples": len(examples),
         },
     }
@@ -621,7 +661,7 @@ def main():
             s = ci * args.chunk_size
             e = min(s + args.chunk_size, len(examples))
             print(f"[chunk {ci + 1}/{n_chunks}] examples {s}–{e - 1}")
-            chunk_images = _load_images(resolved_paths[s:e])
+            chunk_images = [None] * (e - s) if args.no_image else _load_images(resolved_paths[s:e])
             run_iterative(
                 llm, examples[s:e], chunk_images, args.prompt_variant,
                 sampling_kwargs, args.max_tokens,
@@ -651,7 +691,7 @@ def main():
 
             # Decode this chunk's images and build prompts now — and only
             # now — so their memory can be reclaimed after the chunk.
-            chunk_images = _load_images(resolved_paths[s:e])
+            chunk_images = [None] * (e - s) if args.no_image else _load_images(resolved_paths[s:e])
             if args.base_model:
                 chunk_prompts = [
                     _make_raw_prompt(ex, img, args.prompt_variant)

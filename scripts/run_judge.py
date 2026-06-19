@@ -181,10 +181,10 @@ def main():
     if args.num_shards > 1:
         output_path = output_path.parent / f"{output_path.name}_shard{args.shard}.jsonl"
 
-    # Resume: skip examples already written to the output file (this shard)
-    # and also examples in OTHER shard files (enables GPU-count changes).
+    # Resume: skip examples already written to the output file (this shard),
+    # other shard files (enables GPU-count changes), and the merged output.
     done_ids: set[str] = set()
-    for shard_file in sorted(output_path.parent.glob(f"{Path(args.output).name}_shard*.jsonl")):
+    for shard_file in sorted(output_path.parent.glob(f"{Path(args.output).stem}_shard*.jsonl")):
         if not shard_file.exists():
             continue
         with open(shard_file, "r") as f:
@@ -199,6 +199,19 @@ def main():
                 done_ids.add(row.get("data_id", row.get("image_id", "")))
     if output_path.exists():
         with open(output_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                done_ids.add(row.get("data_id", row.get("image_id", "")))
+    # Also read the non-sharded merged output (e.g. _judged.jsonl)
+    merged = output_path.parent / Path(args.output).name
+    if merged.exists() and merged != output_path:
+        with open(merged, "r") as f:
             for line in f:
                 line = line.strip()
                 if not line:

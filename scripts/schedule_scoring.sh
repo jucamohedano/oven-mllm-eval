@@ -91,6 +91,7 @@ INF_JUDGE_N="1"
 INF_JUDGE_TEMPERATURE="0.0"
 INF_JUDGE_TOP_P="1.0"
 INF_JUDGE_TOP_K="-1"
+INF_JUDGE_OUTPUT=""     # override judge output path (default: auto-derived)
 
 # Scoring
 SCORING_INPUT=""
@@ -131,6 +132,7 @@ main() {
             --judge-temperature) INF_JUDGE_TEMPERATURE="$2"; shift 2 ;;
             --judge-top-p)      INF_JUDGE_TOP_P="$2"; shift 2 ;;
             --judge-top-k)      INF_JUDGE_TOP_K="$2"; shift 2 ;;
+            --judge-output)     INF_JUDGE_OUTPUT="$2"; shift 2 ;;
             *) echo "Error: unknown option: $1" >&2; exit 1 ;;
         esac
     done
@@ -246,7 +248,12 @@ SAMPLES="$SCORING_INPUT"
 
 if [[ -n "$INF_JUDGE_MODEL" ]]; then
     echo "[info] Judging \$SAMPLES (GPUs=$INF_JUDGE_GPUS)..."
-    JUDGED="\$(dirname "\$SAMPLES")/\$(basename "\$SAMPLES" .jsonl)_judged.jsonl"
+    _JUDGE_SLUG="\$(echo "$INF_JUDGE_MODEL" | tr '/' '_' | tr '[:upper:]' '[:lower:]')"
+    if [[ -n "$INF_JUDGE_OUTPUT" ]]; then
+        JUDGED="$INF_JUDGE_OUTPUT"
+    else
+        JUDGED="\$(dirname "\$SAMPLES")/\$(basename "\$SAMPLES" .jsonl)_judged_\${_JUDGE_SLUG}.jsonl"
+    fi
 
     if [[ "$INF_JUDGE_GPUS" -le 1 ]]; then
         CUDA_VISIBLE_DEVICES=0 python -m scripts.run_judge \\
@@ -308,14 +315,24 @@ python -m scripts.score_predictions \\
     --measure $SCORING_MEASURE \\
     --num-workers $SCORING_NUM_WORKERS
 
-# Clean up intermediate shard files only if scoring succeeded
+# Clean up intermediate shard files only if scoring succeeded AND
+# row counts match between shards and merged files.
 if [[ -s "$SCORING_OUTPUT" ]]; then
-    shard_dir="\$(dirname "\$SAMPLES")"
-    rm -f "\${shard_dir}"/*_shard*.jsonl \
-          "\${shard_dir}"/shard*.log \
-          "\${shard_dir}"/engine_debug_shard*.log \
-          "\${shard_dir}"/mem_timeline.log
-    echo "[cleanup] removed intermediate shard files"
+    _shard_dir="\$(dirname "\$SAMPLES")"
+    _jbase="\$(basename "\$JUDGED" .jsonl)"
+    _judge_shard_total=\$(cat "\${_shard_dir}"/\${_jbase}_shard*.jsonl 2>/dev/null | wc -l)
+    _judge_total=\$(wc -l < "\$JUDGED" 2>/dev/null || echo 0)
+
+    if [[ "\${_judge_shard_total}" -eq "\${_judge_total}" ]]; then
+        rm -f "\${_shard_dir}"/\${_jbase}_shard*.jsonl \
+              "\${_shard_dir}"/shard*.log \
+              "\${_shard_dir}"/engine_debug_shard*.log \
+              "\${_shard_dir}"/mem_timeline.log
+        echo "[cleanup] removed intermediate shard files"
+    else
+        echo "[cleanup] SKIPPED — judge shard/merge mismatch "\
+             "(\${_judge_shard_total} shard vs \${_judge_total} merged)"
+    fi
 fi
 
 echo "[info] Done. Output: $SCORING_OUTPUT"

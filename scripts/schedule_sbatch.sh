@@ -134,6 +134,7 @@ INF_RESUME=false
 # Output
 INF_OUTPUT_DIR=""
 INF_IMAGE_ROOT=""
+INF_NO_IMAGE=false
 
 # Judge (text-only LM for verdicts; when set, runs after inference)
 INF_JUDGE_MODEL=""
@@ -201,6 +202,7 @@ main() {
             --resume)          INF_RESUME=true; shift ;;
             --output-dir)      INF_OUTPUT_DIR="$2"; shift 2 ;;
             --image-root)      INF_IMAGE_ROOT="$2"; shift 2 ;;
+            --no-image)        INF_NO_IMAGE=true; shift ;;
             --tp)              INF_TP="$2"; shift 2 ;;
             --dp)              INF_DP="$2"; shift 2 ;;
             --gpu-util)        INF_GPU_UTIL="$2"; shift 2 ;;
@@ -278,6 +280,12 @@ main() {
         IMAGE_ROOT_FLAG="--image-root $INF_IMAGE_ROOT"
     fi
 
+    # Build no-image flag
+    NO_IMAGE_FLAG=""
+    if [[ "$INF_NO_IMAGE" == true ]]; then
+        NO_IMAGE_FLAG="--no-image"
+    fi
+
     # Build method-specific flags
     METHOD_FLAGS=""
     case "$INF_METHOD" in
@@ -306,6 +314,7 @@ main() {
     echo "  Top-k:        $INF_TOP_K"
     echo "  GPUs:         $SLURM_GPUS  (TP=$INF_TP, DP=$INF_DP)"
     echo "  Max pixels:   $INF_MAX_PIXELS"
+    echo "  No image:     $INF_NO_IMAGE"
     echo "  Base model:   $INF_BASE_MODEL"
     echo "  Judge model:  ${INF_JUDGE_MODEL:-none}  (GPUs=$INF_JUDGE_GPUS, mode=$INF_JUDGE_MODE, n=$INF_JUDGE_N, temp=$INF_JUDGE_TEMPERATURE, top_p=$INF_JUDGE_TOP_P, top_k=$INF_JUDGE_TOP_K)"
     echo "                max_len=$INF_JUDGE_MAX_MODEL_LEN, seqs=$INF_JUDGE_MAX_NUM_SEQS, gpu=$INF_JUDGE_GPU_UTIL"
@@ -419,6 +428,7 @@ if [[ "$INF_DP" -gt 1 ]]; then
                 $ENFORCE_EAGER_FLAG \\
                 $BASE_MODEL_FLAG \\
                 $IMAGE_ROOT_FLAG \\
+                $NO_IMAGE_FLAG \\
                 $METHOD_FLAGS \\
                 $MAX_EXAMPLES_FLAG \\
                 --resume \\
@@ -485,6 +495,7 @@ else
             $ENFORCE_EAGER_FLAG \\
             $BASE_MODEL_FLAG \\
             $IMAGE_ROOT_FLAG \\
+            $NO_IMAGE_FLAG \\
             $METHOD_FLAGS \\
             $MAX_EXAMPLES_FLAG \\
             --resume \\
@@ -502,6 +513,7 @@ fi
 JOB1EOF
 
         # ── Job 2: Judge + Scoring (1 GPU) ──────────────────────
+        _JUDGE_SLUG="$(echo "$INF_JUDGE_MODEL" | tr '/' '_' | tr '[:upper:]' '[:lower:]')"
         cat > "$TMPDIR/job2.sh" << JOB2EOF
 #!/bin/bash
 #SBATCH --job-name=${SLURM_NAME}-judge
@@ -519,6 +531,8 @@ $SLURM_ACCOUNT_DIRECTIVE
 set -euo pipefail
 _cleanup() { local rc=\$?; trap '' TERM; kill 0 2>/dev/null; exit \$rc; }
 trap _cleanup EXIT
+OUTPUT_DIR="${OUTPUT_DIR}"
+RUN_ID="${RUN_ID}"
 cd "\$SLURM_SUBMIT_DIR"
 module load nvhpc/24.5 gcc/12.2.0
 export CC=gcc CXX=g++ OMP_NUM_THREADS=1
@@ -527,13 +541,22 @@ source .venv/bin/activate
 
 echo "[info] Job 2 (judge+score)"
 
+# Merge inference shard files (if any) PLUS any DP=1 output into
+# a single _samples.jsonl.  This covers both a clean DP=1 run and a
+# resume where a previous DP>1 run left shard files behind.
 SAMPLES="${OUTPUT_DIR}/${RUN_ID}_samples.jsonl"
+_shard_files=(\$(ls "\${OUTPUT_DIR}"/\${RUN_ID}_samples_shard*.jsonl 2>/dev/null | sort))
+if [[ \${#_shard_files[@]} -gt 0 ]]; then
+    echo "[info] Merging \${#_shard_files[@]} inference shards + existing samples → \${SAMPLES}"
+    cat "\${_shard_files[@]}" "\${SAMPLES}" 2>/dev/null > "\${SAMPLES}.tmp"
+    mv "\${SAMPLES}.tmp" "\${SAMPLES}"
+fi
 if [[ ! -s "\${SAMPLES}" ]]; then
-    echo "[error] Samples file not found: \${SAMPLES}" >&2
+    echo "[error] Samples file not found or empty: \${SAMPLES}" >&2
     exit 1
 fi
 
-JUDGED="${OUTPUT_DIR}/${RUN_ID}_judged.jsonl"
+JUDGED="${OUTPUT_DIR}/${RUN_ID}_judged_${_JUDGE_SLUG}.jsonl"
 if [[ "$INF_JUDGE_GPUS" -le 1 ]]; then
     echo "[info] Judging \${SAMPLES} (1 GPU)..."
     CUDA_VISIBLE_DEVICES=0 python -m scripts.run_judge \\
@@ -588,13 +611,26 @@ python -m scripts.score_predictions \\
     --measure $SCORING_MEASURE \\
     --num-workers $INF_SCORING_WORKERS
 
-# Clean up intermediate shard files only if scoring succeeded
+# Clean up intermediate shard files only if scoring succeeded AND the
+# merged file accounts for every row in the shards (data-safe check).
 if [[ -s "${OUTPUT_DIR}/${RUN_ID}_scored.jsonl" ]]; then
-    rm -f "${OUTPUT_DIR}"/*_shard*.jsonl \
-          "${OUTPUT_DIR}"/shard*.log \
-          "${OUTPUT_DIR}"/engine_debug_shard*.log \
-          "${OUTPUT_DIR}"/mem_timeline.log
-    echo "[cleanup] removed intermediate shard files"
+    _shard_total=\$(cat "${OUTPUT_DIR}"/${RUN_ID}_samples_shard*.jsonl 2>/dev/null | wc -l)
+    _merged_total=\$(wc -l < "${OUTPUT_DIR}/${RUN_ID}_samples.jsonl")
+    _judge_shard_total=\$(cat "${OUTPUT_DIR}"/${RUN_ID}_judged_\${_JUDGE_SLUG}_shard*.jsonl 2>/dev/null | wc -l)
+    _judge_total=\$(wc -l < "${OUTPUT_DIR}/${RUN_ID}_judged_\${_JUDGE_SLUG}.jsonl")
+
+    if [[ "\${_merged_total}" -gt 0 && "\${_judge_shard_total}" -eq "\${_judge_total}" ]]; then
+        rm -f "${OUTPUT_DIR}"/${RUN_ID}_samples_shard*.jsonl \
+              "${OUTPUT_DIR}"/${RUN_ID}_judged_\${_JUDGE_SLUG}_shard*.jsonl \
+              "${OUTPUT_DIR}"/shard*.log \
+              "${OUTPUT_DIR}"/engine_debug_shard*.log \
+              "${OUTPUT_DIR}"/mem_timeline.log
+        echo "[cleanup] removed intermediate shard files"
+    else
+        echo "[cleanup] SKIPPED — shard/merge mismatch "\
+             "(samples: \${_shard_total} shard vs \${_merged_total} merged, "\
+             "judge: \${_judge_shard_total} shard vs \${_judge_total} merged)"
+    fi
 fi
 
 echo "[info] Done. Output: ${OUTPUT_DIR}"
@@ -750,6 +786,7 @@ if [[ "$INF_DP" -gt 1 ]]; then
                 $ENFORCE_EAGER_FLAG \\
                 $BASE_MODEL_FLAG \\
                 $IMAGE_ROOT_FLAG \\
+                $NO_IMAGE_FLAG \\
                 \$([ "$INF_METHOD" = "naive-sampling" ] && echo "--samples-per-example $INF_SAMPLES_PER_EXAMPLE") \\
                 \$([ "$INF_METHOD" = "iterative" ] && echo "--attempts-per-round $INF_ATTEMPTS_PER_ROUND --max-rounds $INF_MAX_ROUNDS --enable-feedback $INF_FEEDBACK --max-feedback-chars $INF_MAX_FEEDBACK_CHARS") \\
                 $MAX_EXAMPLES_FLAG \\
@@ -842,6 +879,7 @@ else
             $ENFORCE_EAGER_FLAG \\
             $BASE_MODEL_FLAG \\
             $IMAGE_ROOT_FLAG \\
+            $NO_IMAGE_FLAG \\
             \$([ "$INF_METHOD" = "naive-sampling" ] && echo "--samples-per-example $INF_SAMPLES_PER_EXAMPLE") \\
             \$([ "$INF_METHOD" = "iterative" ] && echo "--attempts-per-round $INF_ATTEMPTS_PER_ROUND --max-rounds $INF_MAX_ROUNDS --enable-feedback $INF_FEEDBACK --max-feedback-chars $INF_MAX_FEEDBACK_CHARS") \\
             $MAX_EXAMPLES_FLAG \\
@@ -877,13 +915,22 @@ python -m scripts.score_predictions \\
     --measure $SCORING_MEASURE \\
     --num-workers $INF_SCORING_WORKERS
 
-# Clean up intermediate shard files only if scoring succeeded
+# Clean up intermediate shard files only if scoring succeeded AND
+# the merged file is non-empty.  (No judge runs in this pipeline,
+# so only inference shards need cleanup.)
 if [[ -s "\${SCORED_OUT}" ]]; then
-    rm -f "\${OUTPUT_DIR}"/*_shard*.jsonl \
-          "\${OUTPUT_DIR}"/shard*.log \
-          "\${OUTPUT_DIR}"/engine_debug_shard*.log \
-          "\${OUTPUT_DIR}"/mem_timeline.log
-    echo "[cleanup] removed intermediate shard files"
+    _shard_total=\$(cat "${OUTPUT_DIR}"/${RUN_ID}_samples_shard*.jsonl 2>/dev/null | wc -l)
+    _merged_total=\$(wc -l < "${OUTPUT_DIR}"/${RUN_ID}_samples.jsonl)
+
+    if [[ "\${_merged_total}" -gt 0 ]]; then
+        rm -f "${OUTPUT_DIR}"/${RUN_ID}_samples_shard*.jsonl \
+              "${OUTPUT_DIR}"/shard*.log \
+              "${OUTPUT_DIR}"/engine_debug_shard*.log \
+              "${OUTPUT_DIR}"/mem_timeline.log
+        echo "[cleanup] removed intermediate shard files"
+    else
+        echo "[cleanup] SKIPPED — merged file is empty"
+    fi
 fi
 
 echo "[info] Done."
