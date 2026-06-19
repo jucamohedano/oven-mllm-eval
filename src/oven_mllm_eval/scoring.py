@@ -34,11 +34,16 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def _derive_results_path(samples_path: Path) -> Path:
-    """Derive the results JSON path from the samples JSONL path.
+    """Derive the results JSON path from the samples or judged JSONL path.
 
     ``<run_id>_samples.jsonl`` → ``<run_id>_results.json``
+    ``<run_id>_judged_qwen_qwen3-4b.jsonl`` → ``<run_id>_results_qwen_qwen3-4b.json``
     """
-    m = re.match(r"(.+)_samples\.jsonl$", samples_path.name)
+    name = samples_path.name
+    m = re.match(r"(.+)_judged_(\w+)\.jsonl$", name)
+    if m:
+        return samples_path.parent / f"{m.group(1)}_results_{m.group(2)}.json"
+    m = re.match(r"(.+)_samples\.jsonl$", name)
     if m:
         return samples_path.parent / f"{m.group(1)}_results.json"
     return samples_path.parent / "generations_results.json"
@@ -291,65 +296,43 @@ def score_generation_file(
         summaries.append({"measure": matcher_name, "metrics": s})
 
     # ── pass@k from judge verdicts ──────────────────────────────────
-    # Compute pass@k using the unbiased estimator from the Codex paper:
-    #   pass@k = E[ 1 - C(n-c, k) / C(n, k) ]
-    # where n = number of rollouts, c = number judged correct.
-    #
-    # When ``judge_verdicts_majority`` is present, a second set of pass@k
-    # values is computed from the majority-vote verdicts and published as
-    # ``pass@{k}_majority``.
+    # Uses the numerically stable product-form estimator:
+    #   pass@k(n, c, k) = 1 - ∏_{i=0}^{k-1} (n - c - i) / (n - i)
+    # which is equivalent to 1 - C(n-c, k) / C(n, k).
+    from oven_mllm_eval.pass_at_k import pass_at_k as _pass_at_k_fn
+
     _judge_rows = [r for r in scored_rows if r.get("judge_verdicts")]
     if _judge_rows:
-        from scipy.special import comb as _comb
-
         _ns = [len(r["judge_verdicts"]) for r in _judge_rows]
         _n_max = max(_ns) if _ns else 0
         _candidate_ks = [2**i for i in range(0, 12)]  # 1, 2, 4, 8, ..., 2048
         _ks = sorted({k for k in _candidate_ks if 0 < k <= _n_max})
         _ks.append(_n_max)  # always include the full rollout count
 
-        # First-prediction pass@k (always available)
-        _pass_at_k: dict[str, float] = {}
-        for _k in _ks:
-            _vals: list[float] = []
-            for _n, r in zip(_ns, _judge_rows):
-                _c = sum(r["judge_verdicts"])
-                if _n < _k:
-                    _vals.append(1.0 if _c > 0 else 0.0)
-                elif _n - _c < _k:
-                    _vals.append(1.0)
-                else:
-                    _vals.append(
-                        1.0
-                        - float(_comb(_n - _c, _k, exact=True))
-                        / float(_comb(_n, _k, exact=True))
-                    )
-            _pass_at_k[f"pass@{_k}"] = sum(_vals) / len(_vals)
-
-        # Majority-vote pass@k (extra, when available from free-form judge n>1)
-        if any(r.get("judge_verdicts_majority") for r in _judge_rows):
+        def _compute_pass_at_k(verdicts_key: str) -> dict[str, float]:
+            result: dict[str, float] = {}
             for _k in _ks:
                 _vals: list[float] = []
                 for _n, r in zip(_ns, _judge_rows):
-                    _mv = r.get("judge_verdicts_majority")
-                    if _mv is None:
-                        # Example not voted (e.g. empty all_texts) — skip
+                    _v = r.get(verdicts_key)
+                    if _v is None:
                         continue
-                    _c = sum(_mv)
-                    if _n < _k:
-                        _vals.append(1.0 if _c > 0 else 0.0)
-                    elif _n - _c < _k:
-                        _vals.append(1.0)
-                    else:
-                        _vals.append(
-                            1.0
-                            - float(_comb(_n - _c, _k, exact=True))
-                            / float(_comb(_n, _k, exact=True))
-                        )
+                    _c = sum(_v)
+                    if _n == 0:
+                        continue
+                    _vals.append(_pass_at_k_fn(_n, _c, _k))
                 if _vals:
-                    _pass_at_k[f"pass@{_k}_majority"] = sum(_vals) / len(_vals)
+                    result[f"pass@{_k}"] = sum(_vals) / len(_vals)
+            return result
 
-        # Attach pass@k to each measure's summary
+        _pass_at_k = _compute_pass_at_k("judge_verdicts")
+
+        # Majority-vote pass@k (extra, when available)
+        if any(r.get("judge_verdicts_majority") for r in _judge_rows):
+            _pass_at_k_majority = _compute_pass_at_k("judge_verdicts_majority")
+            for _k, _v in _pass_at_k_majority.items():
+                _pass_at_k[f"{_k}_majority"] = _v
+
         for _s in summaries:
             _s["metrics"].update(_pass_at_k)
 
@@ -383,8 +366,27 @@ def score_generation_file(
 
     # Write aggregate results JSON
     summary_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Include judge model info from metadata if available
+    _summary_data: dict = (
+        summaries[0]["metrics"] if len(summaries) == 1
+        else {"measures": summaries}
+    )
+    _judge_meta_files = sorted(input_path.parent.glob(
+        f"{input_path.stem}_shard*_metadata.json"
+    ))
+    if not _judge_meta_files:
+        # Also try with _judged prefix (old naming convention)
+        _judge_meta_files = sorted(input_path.parent.glob(
+            f"{input_path.stem.replace('_samples', '')}_judged*_metadata.json"
+        ))
+    if _judge_meta_files:
+        with open(_judge_meta_files[0]) as _jmf:
+            _jmeta = json.load(_jmf)
+        _summary_data["judge_model"] = _jmeta.get("judge_model", "unknown")
+        _summary_data["judge_mode"] = _jmeta.get("judge_mode", "unknown")
+
     with open(summary_path, "w") as f:
-        json.dump(summaries[0]["metrics"] if len(summaries) == 1 else summaries,
-                  f, indent=2)
+        json.dump(_summary_data, f, indent=2)
 
     return summaries[0]["metrics"] if len(summaries) == 1 else summaries
