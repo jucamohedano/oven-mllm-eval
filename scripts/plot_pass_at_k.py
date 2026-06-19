@@ -91,10 +91,11 @@ def collect_results(logs_root: str | Path) -> dict[str, dict[str, float]]:
             print(f"[skip] {model_dir.name}: no run directories found")
             continue
 
-        # Try common_results.json, then <run_id>_results.json, then generations_results.json
+        # Try common_results.json, then <run_id>_results*.json, then generations_results.json
         results_file = run_dir / "common_results.json"
         if not results_file.exists():
-            results_file = run_dir / f"{run_dir.name}_results.json"
+            results_files = sorted(run_dir.glob(f"{run_dir.name}_results*.json"))
+            results_file = results_files[0] if results_files else run_dir / f"{run_dir.name}_results.json"
         if not results_file.exists():
             results_file = run_dir / "generations_results.json"
         if not results_file.exists():
@@ -105,13 +106,14 @@ def collect_results(logs_root: str | Path) -> dict[str, dict[str, float]]:
             data = json.load(f)
 
         metrics = _extract_metrics(data)
-        pass_k = {k: v for k, v in metrics.items() if k.startswith("pass@")}
+        pass_k = {k: v for k, v in metrics.items()
+                   if k.startswith("pass@") and "_majority" not in k}
         if not pass_k:
             print(f"[skip] {model_dir.name}: no pass@k in results (judge not run yet?)")
             continue
 
         # Sort by k value: pass@1, pass@2, pass@4, ...
-        pass_k = dict(sorted(pass_k.items(), key=lambda kv: int(kv[0].split("@")[1])))
+        pass_k = dict(sorted(pass_k.items(), key=lambda kv: int(kv[0].split("@")[1].split("_")[0])))
         label = _model_label(model_dir.name)
         results[label] = pass_k
         print(f"[ok] {label}: {len(pass_k)} pass@k values from {run_dir.name}")
@@ -123,20 +125,36 @@ def collect_results(logs_root: str | Path) -> dict[str, dict[str, float]]:
 # Plotting
 # ---------------------------------------------------------------------------
 
-def plot_pass_at_k(results: dict[str, dict[str, float]], output_path: str, title: str | None = None):
+def plot_pass_at_k(
+    results: dict[str, dict[str, float]],
+    output_path: str,
+    title: str | None = None,
+    results2: dict[str, dict[str, float]] | None = None,
+    label2: str = "",
+):
     """Create a pass@k comparison plot and save to *output_path*."""
     import matplotlib.pyplot as plt
     import seaborn as sns
 
+    n_colors = len(results) + (len(results2) if results2 else 0)
     sns.set_theme(style="whitegrid")
-    palette = sns.color_palette("colorblind", len(results))
+    palette = sns.color_palette("colorblind", n_colors)
 
     fig, ax = plt.subplots(figsize=(9, 5.5))
 
-    for (label, pass_k), color in zip(results.items(), palette):
+    for i, (label, pass_k) in enumerate(results.items()):
         ks = [int(k.split("@")[1]) for k in pass_k]
         values = list(pass_k.values())
-        ax.plot(ks, values, "o-", label=label, color=color, linewidth=1.8, markersize=4.5)
+        ax.plot(ks, values, "o-", label=label, color=palette[i], linewidth=1.8, markersize=4.5)
+
+    if results2:
+        offset = len(results)
+        for i, (label, pass_k) in enumerate(results2.items()):
+            ks = [int(k.split("@")[1]) for k in pass_k]
+            values = list(pass_k.values())
+            lbl = f"{label} ({label2})" if label2 else label
+            ax.plot(ks, values, "s--", label=lbl, color=palette[offset + i],
+                    linewidth=1.8, markersize=4.5, alpha=0.85)
 
     ax.set_xscale("log", base=2)
     ax.set_xlabel("k (number of rollouts)", fontsize=11)
@@ -146,7 +164,6 @@ def plot_pass_at_k(results: dict[str, dict[str, float]], output_path: str, title
     ax.legend(title="Model", fontsize=9, title_fontsize=10)
     ax.tick_params(labelsize=9)
 
-    # Ensure powers-of-2 tick labels
     from matplotlib.ticker import FixedLocator
     all_ks = sorted({int(k.split("@")[1]) for pass_k in results.values() for k in pass_k})
     ax.xaxis.set_major_locator(FixedLocator(all_ks))
@@ -177,6 +194,10 @@ def main():
                         help="Output image path (default: viz/pass_at_k_comparison.png)")
     parser.add_argument("--title", default=None,
                         help="Plot title (default: auto-generated)")
+    parser.add_argument("--run-dirs2", default=None, nargs="+",
+                        help="Second set of run dirs (dashed lines, e.g. no-image baseline).")
+    parser.add_argument("--label2", default="no image",
+                        help="Label suffix for second set (default: 'no image')")
     args = parser.parse_args()
 
     if args.results_file:
@@ -184,25 +205,39 @@ def main():
         with open(args.results_file) as f:
             data = json.load(f)
         metrics = _extract_metrics(data)
-        pass_k = {k: v for k, v in metrics.items() if k.startswith("pass@")}
+        pass_k = {k: v for k, v in metrics.items()
+                   if k.startswith("pass@") and "_majority" not in k}
         if not pass_k:
             print(f"No pass@k found in {args.results_file}")
             return
-        pass_k = dict(sorted(pass_k.items(), key=lambda kv: int(kv[0].split("@")[1])))
+        pass_k = dict(sorted(pass_k.items(), key=lambda kv: int(kv[0].split("@")[1].split("_")[0])))
         label = Path(args.results_file).parent.parent.name
         results = {_model_label(label): pass_k}
         print(f"[ok] {_model_label(label)}: {len(pass_k)} pass@k values")
     elif args.run_dirs:
-        # Explicit run directories
+        # Explicit run directories — verify all use the same input data
         results = {}
+        inputs_seen: list[tuple[str, str]] = []  # (label, input_file)
         for run_dir in args.run_dirs:
             run_path = Path(run_dir)
             if not run_path.is_dir():
                 print(f"[skip] {run_dir}: not a directory")
                 continue
+            # Read metadata to check input file
+            meta_files = sorted(run_path.glob("*_metadata.json"))
+            meta_files = [m for m in meta_files if not m.name.endswith("_shard0_metadata.json")
+                          and not m.name.endswith("_shard1_metadata.json")
+                          and not m.name.endswith("_shard2_metadata.json")
+                          and not m.name.endswith("_shard3_metadata.json")]
+            input_file = None
+            if meta_files:
+                with open(meta_files[0]) as f:
+                    meta = json.load(f)
+                input_file = meta.get("data", {}).get("input", "unknown")
             results_file = run_path / "common_results.json"
             if not results_file.exists():
-                results_file = run_path / f"{run_path.name}_results.json"
+                results_files = sorted(run_path.glob(f"{run_path.name}_results*.json"))
+                results_file = results_files[0] if results_files else run_path / f"{run_path.name}_results.json"
             if not results_file.exists():
                 results_file = run_path / "generations_results.json"
             if not results_file.exists():
@@ -211,14 +246,36 @@ def main():
             with open(results_file) as f:
                 data = json.load(f)
             metrics = _extract_metrics(data)
-            pass_k = {k: v for k, v in metrics.items() if k.startswith("pass@")}
+            pass_k = {k: v for k, v in metrics.items()
+                       if k.startswith("pass@") and "_majority" not in k}
             if not pass_k:
                 print(f"[skip] {run_dir}: no pass@k in results")
                 continue
-            pass_k = dict(sorted(pass_k.items(), key=lambda kv: int(kv[0].split("@")[1])))
+            pass_k = dict(sorted(pass_k.items(), key=lambda kv: int(kv[0].split("@")[1].split("_")[0])))
             label = _model_label(run_path.parent.name)
             results[label] = pass_k
-            print(f"[ok] {label}: {len(pass_k)} pass@k values from {run_path.name}")
+            inputs_seen.append((label, input_file or "unknown"))
+            print(f"[ok] {label}: {len(pass_k)} pass@k values from {run_path.name}"
+                  f"  (input: {input_file or '?'})")
+
+        # Assert same input file
+        unique_inputs = set(inp for _, inp in inputs_seen)
+        if len(unique_inputs) > 1:
+            print(f"[ERROR] Runs use different input files:")
+            for label, inp in inputs_seen:
+                print(f"  {label}: {inp}")
+            return
+        if unique_inputs:
+            input_tag = next(iter(unique_inputs))
+            # Derive a short label from the input path
+            if "aligned" in input_tag:
+                input_note = "aligned questions"
+            elif "vlm_compatible_val.jsonl" in input_tag:
+                input_note = "original OVEN questions"
+            else:
+                input_note = Path(input_tag).stem
+            if not args.title:
+                args.title = f"pass@k — {input_note} (naive-sampling, 256 rollouts)"
     elif args.logs_root:
         results = collect_results(args.logs_root)
     else:
@@ -228,7 +285,35 @@ def main():
         print("No results with pass@k found — has the judge pipeline run?")
         return
 
-    plot_pass_at_k(results, args.output, args.title)
+    results2: dict[str, dict[str, float]] = {}
+    if args.run_dirs2:
+        for run_dir in args.run_dirs2:
+            run_path = Path(run_dir)
+            if not run_path.is_dir():
+                print(f"[skip] {run_dir}: not a directory")
+                continue
+            results_file = run_path / "common_results.json"
+            if not results_file.exists():
+                results_files = sorted(run_path.glob(f"{run_path.name}_results*.json"))
+                results_file = results_files[0] if results_files else run_path / f"{run_path.name}_results.json"
+            if not results_file.exists():
+                results_file = run_path / "generations_results.json"
+            if not results_file.exists():
+                print(f"[skip] {run_dir}: no _results.json found")
+                continue
+            with open(results_file) as f:
+                data = json.load(f)
+            metrics = _extract_metrics(data)
+            pass_k = {k: v for k, v in metrics.items()
+                       if k.startswith("pass@") and "_majority" not in k}
+            if not pass_k:
+                continue
+            pass_k = dict(sorted(pass_k.items(), key=lambda kv: int(kv[0].split("@")[1].split("_")[0])))
+            label = _model_label(run_path.parent.name)
+            results2[label] = pass_k
+            print(f"[ok] {label} ({args.label2}): {len(pass_k)} pass@k values from {run_path.name}")
+
+    plot_pass_at_k(results, args.output, args.title, results2 if results2 else None, args.label2)
 
 
 if __name__ == "__main__":
