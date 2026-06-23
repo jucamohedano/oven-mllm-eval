@@ -30,7 +30,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from oven_mllm_eval.scoring import score_generation_file
+from oven_mllm_eval.scoring import aggregate_scored_file, score_generation_file
 
 
 def main():
@@ -50,16 +50,27 @@ def main():
                         help="Number of worker processes for parallel scoring. "
                              "0 = auto (all available CPUs via sched_getaffinity). "
                              "Each worker loads its own copy of the taxonomy index.")
+    parser.add_argument("--aggregate", "--agregate", action="store_true",
+                        help="Only aggregate metrics from an already-scored JSONL. "
+                             "Does not load the taxonomy index, recompute matches, "
+                             "or write per-example scored rows.")
     args = parser.parse_args()
 
-    summary = score_generation_file(
-        input_path=args.input,
-        taxonomy_index_path=args.taxonomy_index,
-        output_path=args.output,
-        summary_path=args.summary,
-        measure=args.measure,
-        num_workers=args.num_workers,
-    )
+    if args.aggregate:
+        summary = aggregate_scored_file(
+            input_path=args.input,
+            summary_path=args.summary,
+            measure=args.measure,
+        )
+    else:
+        summary = score_generation_file(
+            input_path=args.input,
+            taxonomy_index_path=args.taxonomy_index,
+            output_path=args.output,
+            summary_path=args.summary,
+            measure=args.measure,
+            num_workers=args.num_workers,
+        )
 
     print("Summary:")
     if isinstance(summary, list):

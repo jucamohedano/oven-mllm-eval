@@ -40,7 +40,7 @@ def _derive_results_path(samples_path: Path) -> Path:
     ``<run_id>_judged_qwen_qwen3-4b.jsonl`` → ``<run_id>_results_qwen_qwen3-4b.json``
     """
     name = samples_path.name
-    m = re.match(r"(.+)_judged_(\w+)\.jsonl$", name)
+    m = re.match(r"(.+?)(?:_samples)?_judged_([A-Za-z0-9_.-]+)\.jsonl$", name)
     if m:
         return samples_path.parent / f"{m.group(1)}_results_{m.group(2)}.json"
     m = re.match(r"(.+)_samples\.jsonl$", name)
@@ -390,3 +390,169 @@ def score_generation_file(
         json.dump(_summary_data, f, indent=2)
 
     return summaries[0]["metrics"] if len(summaries) == 1 else summaries
+
+
+def aggregate_scored_file(
+    input_path: str | Path,
+    summary_path: Optional[str | Path] = None,
+    measure: str | Sequence[str] = "exact_match",
+) -> dict | list[dict]:
+    """Aggregate an already-scored JSONL file without recomputing matches.
+
+    This is useful when per-row ``<measure>_hP``, ``<measure>_hR``,
+    ``<measure>_hF``, and ``<measure>_exact_match`` fields already exist and
+    only the aggregate results JSON needs to be regenerated.
+    """
+    input_path = Path(input_path)
+    if summary_path is None:
+        summary_path = _derive_results_path(input_path)
+    else:
+        summary_path = Path(summary_path)
+
+    if isinstance(measure, str):
+        measure_names = [measure]
+    else:
+        measure_names = list(measure)
+    if measure_names == ["all"]:
+        measure_names = sorted({
+            key[:-3]
+            for row in _iter_jsonl(input_path)
+            for key in row
+            if key.endswith("_hP")
+        })
+
+    rows = list(_iter_jsonl(input_path))
+    summaries = []
+    for matcher_name in measure_names:
+        required = [
+            f"{matcher_name}_hP",
+            f"{matcher_name}_hR",
+            f"{matcher_name}_hF",
+            f"{matcher_name}_exact_match",
+        ]
+        missing = [field for field in required if rows and field not in rows[0]]
+        if missing:
+            raise ValueError(
+                f"Input does not look scored for measure '{matcher_name}'. "
+                f"Missing fields: {missing}"
+            )
+
+        hP: list[float] = []
+        hR: list[float] = []
+        hF: list[float] = []
+        exact: list[int] = []
+        mapped = 0
+        for row in rows:
+            reference_path = row.get("scored_reference_path")
+            predicted_path = row.get(f"{matcher_name}_predicted_path")
+            if predicted_path is None or reference_path is None:
+                continue
+            hP.append(float(row.get(f"{matcher_name}_hP", 0.0) or 0.0))
+            hR.append(float(row.get(f"{matcher_name}_hR", 0.0) or 0.0))
+            hF.append(float(row.get(f"{matcher_name}_hF", 0.0) or 0.0))
+            exact.append(int(bool(row.get(f"{matcher_name}_exact_match", False))))
+            mapped += 1
+
+        if mapped:
+            metrics = {
+                "hP": sum(hP) / len(hP),
+                "hR": sum(hR) / len(hR),
+                "hF": sum(hF) / len(hF),
+                "exact": sum(exact) / len(exact),
+                "num_examples": len(rows),
+                "num_mapped": mapped,
+            }
+        else:
+            metrics = {
+                "hP": 0.0,
+                "hR": 0.0,
+                "hF": 0.0,
+                "exact": 0.0,
+                "num_examples": len(rows),
+                "num_mapped": 0,
+            }
+        summaries.append({"measure": matcher_name, "metrics": metrics})
+
+    _add_judge_metrics(summaries, rows)
+    _write_summary(input_path, summary_path, summaries)
+    return summaries[0]["metrics"] if len(summaries) == 1 else summaries
+
+
+def _iter_jsonl(path: Path):
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if line:
+                yield json.loads(line)
+
+
+def _add_judge_metrics(summaries: list[dict], scored_rows: list[dict]) -> None:
+    from oven_mllm_eval.pass_at_k import pass_at_k as _pass_at_k_fn
+
+    _judge_rows = [r for r in scored_rows if r.get("judge_verdicts")]
+    if _judge_rows:
+        _ns = [len(r["judge_verdicts"]) for r in _judge_rows]
+        _n_max = max(_ns) if _ns else 0
+        _candidate_ks = [2**i for i in range(0, 12)]
+        _ks = sorted({k for k in _candidate_ks if 0 < k <= _n_max})
+        _ks.append(_n_max)
+
+        def _compute_pass_at_k(verdicts_key: str) -> dict[str, float]:
+            result: dict[str, float] = {}
+            for _k in _ks:
+                _vals: list[float] = []
+                for _n, row in zip(_ns, _judge_rows):
+                    _v = row.get(verdicts_key)
+                    if _v is None:
+                        continue
+                    _c = sum(_v)
+                    if _n == 0:
+                        continue
+                    _vals.append(_pass_at_k_fn(_n, _c, _k))
+                if _vals:
+                    result[f"pass@{_k}"] = sum(_vals) / len(_vals)
+            return result
+
+        _pass_at_k = _compute_pass_at_k("judge_verdicts")
+        if any(r.get("judge_verdicts_majority") for r in _judge_rows):
+            _pass_at_k_majority = _compute_pass_at_k("judge_verdicts_majority")
+            for _k, _v in _pass_at_k_majority.items():
+                _pass_at_k[f"{_k}_majority"] = _v
+
+        for _s in summaries:
+            _s["metrics"].update(_pass_at_k)
+
+    _judge_unparseable = 0
+    _judge_rollouts = 0
+    for row in scored_rows:
+        _ok = row.get("judge_parse_ok")
+        if _ok is not None:
+            _judge_rollouts += len(_ok)
+            _judge_unparseable += sum(1 for ok in _ok if not ok)
+    if _judge_rollouts:
+        for _s in summaries:
+            _s["metrics"]["num_judge_unparseable"] = _judge_unparseable
+            _s["metrics"]["num_judge_rollouts"] = _judge_rollouts
+
+
+def _write_summary(input_path: Path, summary_path: Path, summaries: list[dict]) -> None:
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_data: dict = (
+        summaries[0]["metrics"] if len(summaries) == 1
+        else {"measures": summaries}
+    )
+    judge_meta_files = sorted(input_path.parent.glob(
+        f"{input_path.stem}_shard*_metadata.json"
+    ))
+    if not judge_meta_files:
+        judge_meta_files = sorted(input_path.parent.glob(
+            f"{input_path.stem.replace('_samples', '')}_judged*_metadata.json"
+        ))
+    if judge_meta_files:
+        with open(judge_meta_files[0]) as handle:
+            judge_meta = json.load(handle)
+        summary_data["judge_model"] = judge_meta.get("judge_model", "unknown")
+        summary_data["judge_mode"] = judge_meta.get("judge_mode", "unknown")
+
+    with open(summary_path, "w", encoding="utf-8") as handle:
+        json.dump(summary_data, handle, indent=2)
