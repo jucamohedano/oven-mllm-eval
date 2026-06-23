@@ -32,6 +32,30 @@ def _has_files(run_dir: Path, pattern: str) -> int:
     return len(list(run_dir.glob(pattern)))
 
 
+def _count_lines(path: Path) -> int:
+    try:
+        with path.open("rb") as f:
+            return sum(1 for _ in f)
+    except OSError:
+        return 0
+
+
+def _count_examples_from_files(run_dir: Path) -> int:
+    """Prefer actual sample row counts over possibly stale metadata."""
+    merged = sorted(
+        f for f in run_dir.glob("*_samples.jsonl")
+        if "_shard" not in f.name and "_judged" not in f.name
+    )
+    if merged:
+        return max(_count_lines(f) for f in merged)
+
+    shards = sorted(run_dir.glob("*_samples_shard*.jsonl"))
+    if shards:
+        return sum(_count_lines(f) for f in shards)
+
+    return 0
+
+
 def _find_judge_model(run_dir: Path) -> str:
     """Extract judge model from judge shard metadata files."""
     for mf in sorted(run_dir.glob("*_judged*_shard*_metadata.json")):
@@ -71,7 +95,7 @@ def _scan_run(run_dir: Path, logs_dir: Path) -> dict | None:
     sharding = inference_meta.get("sharding", {})
     num_shards = sharding.get("num_shards", 1)
     n_per_shard = data.get("num_examples", 0)
-    total_examples = num_shards * n_per_shard
+    total_examples = _count_examples_from_files(run_dir) or num_shards * n_per_shard
 
     # Detect output files
     scored = _has_files(run_dir, "*_scored.jsonl")
@@ -131,6 +155,8 @@ def catalog(logs_dir: Path, filter_dir: str | None = None) -> list[dict]:
 
     # Second pass: timestamped dirs without metadata (crashed before writing anything)
     for run_dir in sorted(logs_dir.glob("*/*/20*")):
+        if filter_dir and not str(run_dir).startswith(str(logs_dir / filter_dir)):
+            continue
         rd = str(run_dir)
         if rd not in seen_dirs and run_dir.is_dir():
             seen_dirs.add(rd)

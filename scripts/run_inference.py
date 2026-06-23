@@ -432,6 +432,7 @@ def main():
                 examples.append(json.loads(line))
     if args.max_examples:
         examples = examples[:args.max_examples]
+    input_num_examples = len(examples)
 
     # Strided sharding — balances load even if the file is ordered by category/size.
     if args.num_shards > 1:
@@ -439,6 +440,7 @@ def main():
             parser.error(f"--shard must be in [0, {args.num_shards}), got {args.shard}")
         examples = examples[args.shard::args.num_shards]
         print(f"Shard {args.shard}/{args.num_shards}: {len(examples)} examples")
+    shard_num_examples = len(examples)
 
     # Progress bars use \r redraws that collide when multiple shards share stdout.
     show_tqdm = args.num_shards <= 1
@@ -457,6 +459,7 @@ def main():
     # filter before loading images.  This allows a crashed DP shard to
     # resume on a different GPU count (the remaining work is split across
     # whatever --num-shards is currently set to).
+    resume_already_done = 0
     if args.resume:
         done_ids: set[str] = set()
         # Collect IDs from every _shard*.jsonl file (global resume set)
@@ -510,6 +513,7 @@ def main():
                 tmp.replace(output_path)
 
         examples = [e for e in examples if e.get("data_id", e.get("image_id", "")) not in done_ids]
+        resume_already_done = len(done_ids)
         print(f"Resuming: {len(done_ids)} already done, {len(examples)} remaining")
 
     if not examples:
@@ -626,6 +630,10 @@ def main():
             "max_examples": args.max_examples,
             "chunk_size": args.chunk_size,
             "resume": args.resume,
+            "input_num_examples": input_num_examples,
+            "shard_num_examples": shard_num_examples,
+            "resume_already_done": resume_already_done,
+            "resume_remaining_examples": len(examples),
             "no_image": args.no_image,
             "num_examples": len(examples),
         },
