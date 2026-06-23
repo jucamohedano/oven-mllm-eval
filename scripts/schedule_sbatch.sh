@@ -55,6 +55,11 @@ Scoring options:
                                   (default: 0.0)
     --judge-top-p <P>             Judge top-p (nucleus) — free-form only (default: 1.0)
     --judge-top-k <K>             Judge top-k — free-form only, -1=disabled (default: -1)
+    --judge-with-desc             Add available ground-truth/parent/grandparent
+                                  descriptions to free-form judge prompts
+    --desc-chains <PATH>          Description chains JSONL
+                                  (default: data/raw/oven_wikidata_chains_cleaned_descs.jsonl)
+    --label-chains <PATH>         Optional label chain override; defaults to taxonomy index
     --scoring-measure <MEASURE>   Measure(s) for DirectMeasureMatcher: exact_match, contained, all
                                   (default: exact_match).  Space-separate for multiple.
     --scoring-workers <N>         Number of CPU workers for parallel scoring (default: 0 = auto)
@@ -147,6 +152,9 @@ INF_JUDGE_N="1"
 INF_JUDGE_TEMPERATURE="0.0"
 INF_JUDGE_TOP_P="1.0"
 INF_JUDGE_TOP_K="-1"
+INF_JUDGE_WITH_DESC=false
+INF_DESC_CHAINS="data/raw/oven_wikidata_chains_cleaned_descs.jsonl"
+INF_LABEL_CHAINS=""
 
 # Scoring
 SCORING_MEASURE="exact_match"
@@ -227,6 +235,9 @@ main() {
             --judge-temperature) INF_JUDGE_TEMPERATURE="$2"; shift 2 ;;
             --judge-top-p)      INF_JUDGE_TOP_P="$2"; shift 2 ;;
             --judge-top-k)      INF_JUDGE_TOP_K="$2"; shift 2 ;;
+            --judge-with-desc)  INF_JUDGE_WITH_DESC=true; shift ;;
+            --desc-chains)      INF_DESC_CHAINS="$2"; shift 2 ;;
+            --label-chains)     INF_LABEL_CHAINS="$2"; shift 2 ;;
             *) echo "Error: unknown option: $1" >&2; exit 1 ;;
         esac
     done
@@ -242,6 +253,11 @@ main() {
     SLURM_ACCOUNT_DIRECTIVE=""
     if [[ -n "$SLURM_ACCOUNT" ]]; then
         SLURM_ACCOUNT_DIRECTIVE="#SBATCH --account=$SLURM_ACCOUNT"
+    fi
+
+    if [[ "$INF_JUDGE_WITH_DESC" == true && "$INF_JUDGE_MODE" != "free-form" ]]; then
+        echo "[error] --judge-with-desc requires --judge-mode free-form" >&2
+        exit 1
     fi
 
     # Build max-examples flag
@@ -284,6 +300,15 @@ main() {
     NO_IMAGE_FLAG=""
     if [[ "$INF_NO_IMAGE" == true ]]; then
         NO_IMAGE_FLAG="--no-image"
+    fi
+
+    # Build judge description-evidence flags
+    JUDGE_DESC_ARGS=""
+    if [[ "$INF_JUDGE_WITH_DESC" == true ]]; then
+        JUDGE_DESC_ARGS="--judge-with-desc --taxonomy-index $INF_TAXONOMY_INDEX --desc-chains $INF_DESC_CHAINS"
+        if [[ -n "$INF_LABEL_CHAINS" ]]; then
+            JUDGE_DESC_ARGS="$JUDGE_DESC_ARGS --label-chains $INF_LABEL_CHAINS"
+        fi
     fi
 
     # Build method-specific flags
@@ -471,6 +496,7 @@ if [[ "$INF_DP" -gt 1 ]]; then
 
     cat "${OUTPUT_DIR}"/*_samples_shard*.jsonl > "${OUTPUT_DIR}/${RUN_ID}_samples.jsonl"
     echo "[info] Merged \$(wc -l < "${OUTPUT_DIR}/${RUN_ID}_samples.jsonl") samples"
+    python -c "import glob,json; from pathlib import Path; output_dir=Path('${OUTPUT_DIR}'); run_id='${RUN_ID}'; samples=output_dir / f'{run_id}_samples.jsonl'; meta_path=output_dir / f'{run_id}_metadata.json'; meta=json.loads(meta_path.read_text()) if meta_path.exists() else {}; meta.setdefault('data', {}); meta['data']['merged_num_examples']=sum(1 for _ in samples.open()); meta['data']['sample_shard_files']=[Path(p).name for p in sorted(glob.glob(str(output_dir / f'{run_id}_samples_shard*.jsonl')))]; meta['data']['inference_complete']=True; meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False) + '\n')"
 else
     attempt=0
     while true; do
@@ -514,6 +540,10 @@ JOB1EOF
 
         # ── Job 2: Judge + Scoring (1 GPU) ──────────────────────
         _JUDGE_SLUG="$(echo "$INF_JUDGE_MODEL" | tr '/' '_' | tr '[:upper:]' '[:lower:]')"
+        _JUDGE_OUTPUT_SUFFIX="${_JUDGE_SLUG}"
+        if [[ "$INF_JUDGE_WITH_DESC" == true ]]; then
+            _JUDGE_OUTPUT_SUFFIX="${_JUDGE_OUTPUT_SUFFIX}_with_desc"
+        fi
         cat > "$TMPDIR/job2.sh" << JOB2EOF
 #!/bin/bash
 #SBATCH --job-name=${SLURM_NAME}-judge
@@ -541,22 +571,32 @@ source .venv/bin/activate
 
 echo "[info] Job 2 (judge+score)"
 
-# Merge inference shard files (if any) PLUS any DP=1 output into
-# a single _samples.jsonl.  This covers both a clean DP=1 run and a
-# resume where a previous DP>1 run left shard files behind.
+# Merge inference shard files into a single _samples.jsonl.
+# Always overwrite from shard files — they are the authoritative source.
+# Including an existing _samples.jsonl would double data on resume
+# (shard files persist until cleanup after scoring).
 SAMPLES="${OUTPUT_DIR}/${RUN_ID}_samples.jsonl"
 _shard_files=(\$(ls "\${OUTPUT_DIR}"/\${RUN_ID}_samples_shard*.jsonl 2>/dev/null | sort))
 if [[ \${#_shard_files[@]} -gt 0 ]]; then
-    echo "[info] Merging \${#_shard_files[@]} inference shards + existing samples → \${SAMPLES}"
-    cat "\${_shard_files[@]}" "\${SAMPLES}" 2>/dev/null > "\${SAMPLES}.tmp"
+    echo "[info] Merging \${#_shard_files[@]} inference shards → \${SAMPLES}"
+    cat "\${_shard_files[@]}" > "\${SAMPLES}.tmp"
     mv "\${SAMPLES}.tmp" "\${SAMPLES}"
 fi
 if [[ ! -s "\${SAMPLES}" ]]; then
     echo "[error] Samples file not found or empty: \${SAMPLES}" >&2
     exit 1
 fi
+EXPECTED_SAMPLES=\$(wc -l < "$INF_INPUT")
+if [[ -n "$INF_MAX_EXAMPLES" && "$INF_MAX_EXAMPLES" -lt "\${EXPECTED_SAMPLES}" ]]; then
+    EXPECTED_SAMPLES="$INF_MAX_EXAMPLES"
+fi
+ACTUAL_SAMPLES=\$(wc -l < "\${SAMPLES}")
+if [[ "\${ACTUAL_SAMPLES}" -ne "\${EXPECTED_SAMPLES}" ]]; then
+    echo "[error] Refusing to judge incomplete samples: \${ACTUAL_SAMPLES}/\${EXPECTED_SAMPLES} rows in \${SAMPLES}" >&2
+    exit 1
+fi
 
-JUDGED="${OUTPUT_DIR}/${RUN_ID}_judged_${_JUDGE_SLUG}.jsonl"
+JUDGED="${OUTPUT_DIR}/${RUN_ID}_judged_${_JUDGE_OUTPUT_SUFFIX}.jsonl"
 if [[ "$INF_JUDGE_GPUS" -le 1 ]]; then
     echo "[info] Judging \${SAMPLES} (1 GPU)..."
     CUDA_VISIBLE_DEVICES=0 python -m scripts.run_judge \\
@@ -570,7 +610,8 @@ if [[ "$INF_JUDGE_GPUS" -le 1 ]]; then
         --judge-top-k "$INF_JUDGE_TOP_K" \\
         --max-model-len "$INF_JUDGE_MAX_MODEL_LEN" \\
         --max-num-seqs "$INF_JUDGE_MAX_NUM_SEQS" \\
-        --gpu-util "$INF_JUDGE_GPU_UTIL"
+        --gpu-util "$INF_JUDGE_GPU_UTIL" \\
+        $JUDGE_DESC_ARGS
 else
     echo "[info] Judging \${SAMPLES} ($INF_JUDGE_GPUS GPUs, strided)..."
     pids=()
@@ -587,7 +628,8 @@ else
             --judge-top-k "$INF_JUDGE_TOP_K" \\
             --max-model-len "$INF_JUDGE_MAX_MODEL_LEN" \\
             --max-num-seqs "$INF_JUDGE_MAX_NUM_SEQS" \\
-            --gpu-util "$INF_JUDGE_GPU_UTIL" &
+            --gpu-util "$INF_JUDGE_GPU_UTIL" \\
+            $JUDGE_DESC_ARGS &
         pids+=(\$!)
     done
     fail=0
@@ -603,7 +645,7 @@ else
 fi
 
 echo "[info] Scoring \${JUDGED}..."
-SCORED="${OUTPUT_DIR}/${RUN_ID}_scored.jsonl"
+SCORED="${OUTPUT_DIR}/${RUN_ID}_scored_${_JUDGE_OUTPUT_SUFFIX}.jsonl"
 python -m scripts.score_predictions \\
     --input "\${JUDGED}" \\
     --output "\${SCORED}" \\
@@ -613,15 +655,15 @@ python -m scripts.score_predictions \\
 
 # Clean up intermediate shard files only if scoring succeeded AND the
 # merged file accounts for every row in the shards (data-safe check).
-if [[ -s "${OUTPUT_DIR}/${RUN_ID}_scored.jsonl" ]]; then
+if [[ -s "${OUTPUT_DIR}/${RUN_ID}_scored_${_JUDGE_OUTPUT_SUFFIX}.jsonl" ]]; then
     _shard_total=\$(cat "${OUTPUT_DIR}"/${RUN_ID}_samples_shard*.jsonl 2>/dev/null | wc -l)
     _merged_total=\$(wc -l < "${OUTPUT_DIR}/${RUN_ID}_samples.jsonl")
-    _judge_shard_total=\$(cat "${OUTPUT_DIR}"/${RUN_ID}_judged_\${_JUDGE_SLUG}_shard*.jsonl 2>/dev/null | wc -l)
-    _judge_total=\$(wc -l < "${OUTPUT_DIR}/${RUN_ID}_judged_\${_JUDGE_SLUG}.jsonl")
+    _judge_shard_total=\$(cat "${OUTPUT_DIR}"/${RUN_ID}_judged_${_JUDGE_OUTPUT_SUFFIX}.jsonl_shard*.jsonl 2>/dev/null | wc -l)
+    _judge_total=\$(wc -l < "${OUTPUT_DIR}/${RUN_ID}_judged_${_JUDGE_OUTPUT_SUFFIX}.jsonl")
 
     if [[ "\${_merged_total}" -gt 0 && "\${_judge_shard_total}" -eq "\${_judge_total}" ]]; then
         rm -f "${OUTPUT_DIR}"/${RUN_ID}_samples_shard*.jsonl \
-              "${OUTPUT_DIR}"/${RUN_ID}_judged_\${_JUDGE_SLUG}_shard*.jsonl \
+              "${OUTPUT_DIR}"/${RUN_ID}_judged_${_JUDGE_OUTPUT_SUFFIX}.jsonl_shard*.jsonl \
               "${OUTPUT_DIR}"/shard*.log \
               "${OUTPUT_DIR}"/engine_debug_shard*.log \
               "${OUTPUT_DIR}"/mem_timeline.log

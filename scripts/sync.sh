@@ -59,6 +59,10 @@ workspace_exclude_opts=(
     --exclude="uv.lock"
 )
 
+raw_data_files=(
+    "oven_wikidata_chains_cleaned_descs.jsonl"
+)
+
 results_exclude_opts=(
     --exclude="/debug/"
     --exclude="/slurm/"
@@ -99,6 +103,17 @@ for remote in "${remotes[@]}"; do
         "mkdir -p ${remote#*:}/{results,logs,data/raw,data/processed,data/images}" \
         2>/dev/null \
         || echo "[warn] Could not create remote directories via ssh"
+
+    for data_file in "${raw_data_files[@]}"; do
+        local_data_path="$repo_root/data/raw/$data_file"
+        if [[ -f "$local_data_path" ]]; then
+            echo "[info] Syncing data/raw/$data_file → $remote/data/raw/ ..."
+            rsync -azhv "$local_data_path" "$remote/data/raw/" \
+                || echo "[warn] Could not sync data/raw/$data_file"
+        else
+            echo "[warn] Missing local data/raw/$data_file; skipping"
+        fi
+    done
 done
 
 # ---------------------------------------------------------------------------

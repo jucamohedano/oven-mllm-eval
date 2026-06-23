@@ -51,6 +51,12 @@ Judge options:
                                   get diverse completions (default: 0.0)
     --judge-top-p <P>             Judge top-p (nucleus) — free-form only (default: 1.0)
     --judge-top-k <K>             Judge top-k — free-form only, -1=disabled (default: -1)
+    --judge-with-desc             Add available ground-truth/parent/grandparent
+                                  description evidence to free-form judge prompts.
+    --label-chains <PATH>         Optional label chain override. By default, judge
+                                  evidence uses --taxonomy-index, same as scoring.
+    --desc-chains <PATH>          Description chains JSONL
+                                  (default: data/raw/oven_wikidata_chains_cleaned_descs.jsonl)
 
 Scoring options:
     --input <PATH>                Input samples JSONL (required)
@@ -92,6 +98,9 @@ INF_JUDGE_TEMPERATURE="0.0"
 INF_JUDGE_TOP_P="1.0"
 INF_JUDGE_TOP_K="-1"
 INF_JUDGE_OUTPUT=""     # override judge output path (default: auto-derived)
+INF_JUDGE_WITH_DESC="0"
+INF_LABEL_CHAINS=""
+INF_DESC_CHAINS="data/raw/oven_wikidata_chains_cleaned_descs.jsonl"
 
 # Scoring
 SCORING_INPUT=""
@@ -133,6 +142,9 @@ main() {
             --judge-top-p)      INF_JUDGE_TOP_P="$2"; shift 2 ;;
             --judge-top-k)      INF_JUDGE_TOP_K="$2"; shift 2 ;;
             --judge-output)     INF_JUDGE_OUTPUT="$2"; shift 2 ;;
+            --judge-with-desc)  INF_JUDGE_WITH_DESC="1"; shift ;;
+            --label-chains)     INF_LABEL_CHAINS="$2"; shift 2 ;;
+            --desc-chains)      INF_DESC_CHAINS="$2"; shift 2 ;;
             *) echo "Error: unknown option: $1" >&2; exit 1 ;;
         esac
     done
@@ -152,6 +164,10 @@ main() {
         echo "[error] --mem '$SLURM_MEM' has no unit suffix. Did you mean '${SLURM_MEM}G'?" >&2
         exit 1
     fi
+    if [[ "$INF_JUDGE_WITH_DESC" == "1" && "$INF_JUDGE_MODE" != "free-form" ]]; then
+        echo "[error] --judge-with-desc requires --judge-mode free-form" >&2
+        exit 1
+    fi
 
     # Build SLURM account directive
     SLURM_ACCOUNT_DIRECTIVE=""
@@ -159,11 +175,23 @@ main() {
         SLURM_ACCOUNT_DIRECTIVE="#SBATCH --account=$SLURM_ACCOUNT"
     fi
 
+    _JUDGE_SLUG=""
+    if [[ -n "$INF_JUDGE_MODEL" ]]; then
+        _JUDGE_SLUG="$(echo "$INF_JUDGE_MODEL" | tr '/' '_' | tr '[:upper:]' '[:lower:]')"
+        if [[ "$INF_JUDGE_WITH_DESC" == "1" ]]; then
+            _JUDGE_SLUG="${_JUDGE_SLUG}_with_desc"
+        fi
+    fi
+
     # Default output
     if [[ -z "$SCORING_OUTPUT" ]]; then
         INPUT_DIR="$(dirname "$SCORING_INPUT")"
         INPUT_BASENAME="$(basename "$SCORING_INPUT" .jsonl)"
-        SCORING_OUTPUT="${INPUT_DIR}/${INPUT_BASENAME}_scored.jsonl"
+        if [[ -n "$_JUDGE_SLUG" ]]; then
+            SCORING_OUTPUT="${INPUT_DIR}/${INPUT_BASENAME}_scored_${_JUDGE_SLUG}.jsonl"
+        else
+            SCORING_OUTPUT="${INPUT_DIR}/${INPUT_BASENAME}_scored.jsonl"
+        fi
     fi
 
     # Judge defaults
@@ -204,6 +232,13 @@ main() {
     if [[ -n "$INF_JUDGE_MODEL" ]]; then
         echo "  Judge model:  $INF_JUDGE_MODEL  (GPUs=$INF_JUDGE_GPUS)"
         echo "  Judge mode:   $INF_JUDGE_MODE  (n=$INF_JUDGE_N, temp=$INF_JUDGE_TEMPERATURE, top_p=$INF_JUDGE_TOP_P, top_k=$INF_JUDGE_TOP_K)"
+        if [[ "$INF_JUDGE_WITH_DESC" == "1" ]]; then
+            echo "  Judge taxidx: $SCORING_TAXONOMY_INDEX"
+            if [[ -n "$INF_LABEL_CHAINS" ]]; then
+                echo "  Judge labels: $INF_LABEL_CHAINS"
+            fi
+            echo "  Judge desc:   $INF_DESC_CHAINS"
+        fi
     fi
     echo "  Partition:    $SLURM_PARTITION"
     echo "  CPUs:         $SLURM_CPUS"
@@ -245,14 +280,20 @@ echo "  Input:    $SCORING_INPUT"
 echo "  Output:   $SCORING_OUTPUT"
 
 SAMPLES="$SCORING_INPUT"
+JUDGE_DESC_ARGS=()
+if [[ "$INF_JUDGE_WITH_DESC" == "1" ]]; then
+    JUDGE_DESC_ARGS+=(--judge-with-desc --taxonomy-index "$SCORING_TAXONOMY_INDEX" --desc-chains "$INF_DESC_CHAINS")
+    if [[ -n "$INF_LABEL_CHAINS" ]]; then
+        JUDGE_DESC_ARGS+=(--label-chains "$INF_LABEL_CHAINS")
+    fi
+fi
 
 if [[ -n "$INF_JUDGE_MODEL" ]]; then
     echo "[info] Judging \$SAMPLES (GPUs=$INF_JUDGE_GPUS)..."
-    _JUDGE_SLUG="\$(echo "$INF_JUDGE_MODEL" | tr '/' '_' | tr '[:upper:]' '[:lower:]')"
     if [[ -n "$INF_JUDGE_OUTPUT" ]]; then
         JUDGED="$INF_JUDGE_OUTPUT"
     else
-        JUDGED="\$(dirname "\$SAMPLES")/\$(basename "\$SAMPLES" .jsonl)_judged_\${_JUDGE_SLUG}.jsonl"
+        JUDGED="\$(dirname "\$SAMPLES")/\$(basename "\$SAMPLES" .jsonl)_judged_${_JUDGE_SLUG}.jsonl"
     fi
 
     if [[ "$INF_JUDGE_GPUS" -le 1 ]]; then
@@ -265,6 +306,7 @@ if [[ -n "$INF_JUDGE_MODEL" ]]; then
             --judge-temperature "$INF_JUDGE_TEMPERATURE" \\
             --judge-top-p "$INF_JUDGE_TOP_P" \\
             --judge-top-k "$INF_JUDGE_TOP_K" \\
+            "\${JUDGE_DESC_ARGS[@]}" \\
             --max-model-len "$INF_JUDGE_MAX_MODEL_LEN" \\
             --max-num-seqs "$INF_JUDGE_MAX_NUM_SEQS" \\
             --gpu-util "$INF_JUDGE_GPU_UTIL"
@@ -287,6 +329,7 @@ if [[ -n "$INF_JUDGE_MODEL" ]]; then
                 --judge-temperature "$INF_JUDGE_TEMPERATURE" \\
                 --judge-top-p "$INF_JUDGE_TOP_P" \\
                 --judge-top-k "$INF_JUDGE_TOP_K" \\
+                "\${JUDGE_DESC_ARGS[@]}" \\
                 --max-model-len "$INF_JUDGE_MAX_MODEL_LEN" \\
                 --max-num-seqs "$INF_JUDGE_MAX_NUM_SEQS" \\
                 --gpu-util "$INF_JUDGE_GPU_UTIL" &
@@ -315,9 +358,9 @@ python -m scripts.score_predictions \\
     --measure $SCORING_MEASURE \\
     --num-workers $SCORING_NUM_WORKERS
 
-# Clean up intermediate shard files only if scoring succeeded AND
-# row counts match between shards and merged files.
-if [[ -s "$SCORING_OUTPUT" ]]; then
+# Clean up intermediate shard files only if a judge was used, scoring
+# succeeded, and row counts match between shards and merged files.
+if [[ -n "$INF_JUDGE_MODEL" ]] && [[ -s "$SCORING_OUTPUT" ]]; then
     _shard_dir="\$(dirname "\$SAMPLES")"
     _jbase="\$(basename "\$JUDGED" .jsonl)"
     _judge_shard_total=\$(cat "\${_shard_dir}"/\${_jbase}_shard*.jsonl 2>/dev/null | wc -l)

@@ -21,9 +21,6 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from vllm import LLM, SamplingParams
-from vllm.sampling_params import StructuredOutputsParams
-
 # Ensure project is importable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
@@ -32,10 +29,42 @@ from oven_mllm_eval.judge import (
     JUDGE_JSON_SCHEMA,
     build_judge_prompt,
     build_judge_prompt_free_form,
+    build_judge_prompt_free_form_with_desc,
     parse_judge_output,
     parse_free_form_output,
     JudgeParseError,
 )
+from oven_mllm_eval.paths import OVEN_TAXONOMY_INDEX, out_descs
+
+
+def load_taxonomy_chains(path: str | Path) -> dict[str, list[str]]:
+    """Load taxonomy chains keyed by entity QID."""
+    chains: dict[str, list[str]] = {}
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            qid = row.get("id")
+            taxonomy = row.get("taxonomy", [])
+            if qid and isinstance(taxonomy, list):
+                chains[qid] = [str(item) for item in taxonomy]
+    return chains
+
+
+def load_label_chains_from_index(path: str | Path) -> dict[str, list[str]]:
+    """Load entity leaf-to-root label chains from the precomputed taxonomy index."""
+    index = json.loads(Path(path).read_text())
+    chains = {}
+    for qid, path_labels in index.get("entity_id_to_path", {}).items():
+        if not isinstance(path_labels, list):
+            continue
+        labels = [str(label) for label in path_labels]
+        if labels and labels[-1] == "root":
+            labels = labels[:-1]
+        chains[qid] = labels
+    return chains
 
 
 def main():
@@ -91,6 +120,18 @@ def main():
     parser.add_argument("--judge-top-k", type=int, default=-1,
                         help="Judge top-k — only used in free-form mode. "
                              "-1 = disabled (default: -1)")
+    parser.add_argument("--judge-with-desc", action="store_true",
+                        help="Add available ground-truth/parent/grandparent "
+                             "description evidence to free-form judge prompts.")
+    parser.add_argument("--taxonomy-index", default=OVEN_TAXONOMY_INDEX,
+                        help="Path to taxonomy index JSON used for label chains "
+                             f"(default: {OVEN_TAXONOMY_INDEX})")
+    parser.add_argument("--label-chains", default="",
+                        help="Optional override: path to "
+                             "oven_wikidata_chains_cleaned_labels.jsonl")
+    parser.add_argument("--desc-chains", default=out_descs,
+                        help="Path to oven_wikidata_chains_cleaned_descs.jsonl "
+                             f"(default: {out_descs})")
 
     args = parser.parse_args()
 
@@ -117,6 +158,39 @@ def main():
         print("No examples to judge — exiting.")
         return
 
+    label_chains: dict[str, list[str]] = {}
+    desc_chains: dict[str, list[str]] = {}
+    if args.judge_with_desc:
+        if args.judge_mode != "free-form":
+            parser.error("--judge-with-desc is supported only with --judge-mode free-form")
+        desc_path = Path(args.desc_chains)
+        if not desc_path.exists():
+            parser.error(f"--judge-with-desc requires --desc-chains file: {desc_path}")
+        if args.label_chains:
+            label_path = Path(args.label_chains)
+            if not label_path.exists():
+                parser.error(f"--label-chains file not found: {label_path}")
+            label_chains = load_taxonomy_chains(label_path)
+        else:
+            index_path = Path(args.taxonomy_index)
+            if not index_path.exists():
+                parser.error(f"--judge-with-desc requires --taxonomy-index file: {index_path}")
+            label_chains = load_label_chains_from_index(index_path)
+        desc_chains = load_taxonomy_chains(desc_path)
+        available = sum(
+            1
+            for example in examples
+            if any(
+                desc.strip()
+                for desc in desc_chains.get(example.get("entity_id", ""), [])[:3]
+            )
+        )
+        print(
+            f"Loaded taxonomy evidence: {len(label_chains)} label chains, "
+            f"{len(desc_chains)} desc chains "
+            f"({available}/{len(examples)} examples have description evidence)"
+        )
+
     # Quick sanity check
     empty_all_texts = sum(1 for e in examples if not e.get("all_texts"))
     if empty_all_texts:
@@ -126,6 +200,9 @@ def main():
     # ------------------------------------------------------------------
     # Initialize judge LLM
     # ------------------------------------------------------------------
+    from vllm import LLM, SamplingParams
+    from vllm.sampling_params import StructuredOutputsParams
+
     mode = args.judge_mode
     n_gen = args.judge_n
 
@@ -246,10 +323,13 @@ def main():
         # Naive-sampling produces many byte-identical rollouts for short
         # entity answers.  Judge each unique prompt once, then fan the
         # verdict back to every rollout that shares it.
-        build_fn = (
-            build_judge_prompt_free_form if mode == "free-form"
-            else build_judge_prompt
-        )
+        if args.judge_with_desc:
+            build_fn = build_judge_prompt_free_form_with_desc
+        else:
+            build_fn = (
+                build_judge_prompt_free_form if mode == "free-form"
+                else build_judge_prompt
+            )
         prompt_to_pos: dict[str, int] = {}
         unique_prompts: list[str] = []
         plan: list[tuple[dict, list[int]]] = []  # (example, [pos for each rollout])
@@ -261,9 +341,17 @@ def main():
                 continue
             question = example.get("question", "")
             ground_truth = example.get("answer", "")
+            entity_id = example.get("entity_id", "")
+            label_chain = label_chains.get(entity_id)
+            desc_chain = desc_chains.get(entity_id)
             positions: list[int] = []
             for rollout_text in all_texts:
-                prompt = build_fn(question, ground_truth, rollout_text)
+                if args.judge_with_desc:
+                    prompt = build_fn(
+                        question, ground_truth, rollout_text, label_chain, desc_chain
+                    )
+                else:
+                    prompt = build_fn(question, ground_truth, rollout_text)
                 pos = prompt_to_pos.get(prompt)
                 if pos is None:
                     pos = len(unique_prompts)
@@ -430,6 +518,10 @@ def main():
         json.dump({
             "judge_model": args.judge_model,
             "judge_mode": mode,
+            "judge_with_desc": args.judge_with_desc,
+            "label_chains": args.label_chains if args.judge_with_desc else "",
+            "taxonomy_index": args.taxonomy_index if args.judge_with_desc else "",
+            "desc_chains": args.desc_chains if args.judge_with_desc else "",
             "input": args.input,
             "num_examples": processed,
             "parse_errors": parse_errors,

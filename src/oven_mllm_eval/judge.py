@@ -29,6 +29,33 @@ _JUDGE_SYSTEM = (
 )
 
 
+def _format_taxonomy_evidence(
+    label_chain: list[str] | None,
+    desc_chain: list[str] | None,
+) -> str:
+    """Format available GT/parent/grandparent descriptions for judge prompts."""
+    if not desc_chain:
+        return ""
+
+    label_chain = label_chain or []
+    desc_chain = desc_chain or []
+    lines = ["Ground-truth description evidence:"]
+    roles = ("Ground truth", "Parent", "Grandparent")
+    for index, role in enumerate(roles):
+        if len(desc_chain) <= index:
+            continue
+        desc = str(desc_chain[index]).strip()
+        if not desc:
+            continue
+        label = str(label_chain[index]).strip() if len(label_chain) > index else ""
+        if label:
+            lines.append(f"- {role}: {label} — {desc}")
+        else:
+            lines.append(f"- {role}: {desc}")
+
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
 def build_judge_prompt(question: str, ground_truth: str, rollout_text: str) -> str:
     """Build a text-only judge prompt for a single rollout.
 
@@ -123,6 +150,47 @@ def build_judge_prompt_free_form(
         '"1": The response matches the ground-truth.\n\n'
         f'Question: "{question}"\n'
         f'Ground truth: "{ground_truth}"\n'
+        f'Response: "{rollout_text}"\n\n'
+        "Your job is to ONLY check whether the given response matches "
+        "the ground truth answer or not in the context of the question. "
+        "You DO NOT NEED to assess the correctness of the response. "
+        "This is part of an automated evaluation process, therefore you "
+        "MUST OUTPUT your final answer as \"0\" or \"1\" in "
+        "<answer> </answer> tags.\n"
+        "YOU SHOULD ALWAYS END YOUR RESPONSE WITH <answer>0</answer> OR "
+        "<answer>1</answer> TAGS."
+    )
+
+
+def build_judge_prompt_free_form_with_desc(
+    question: str,
+    ground_truth: str,
+    rollout_text: str,
+    label_chain: list[str] | None,
+    desc_chain: list[str] | None,
+) -> str:
+    """Build a free-form judge prompt with optional description evidence."""
+    evidence = _format_taxonomy_evidence(label_chain, desc_chain)
+    if not evidence:
+        return build_judge_prompt_free_form(question, ground_truth, rollout_text)
+
+    return (
+        "Your task is to judge whether the given response to a question "
+        "matches a given ground truth answer or not. You are provided with "
+        "a question, a ground truth answer, supporting description evidence for "
+        "the ground truth answer, and the response you need to judge.\n\n"
+        "The response matches the ground truth if both are semantically "
+        "equivalent — they refer to the same entity at the level of "
+        "specificity asked by the question.\n\n"
+        "Use the description evidence only to disambiguate the ground-truth "
+        "answer. Do not mark a response correct merely because it matches "
+        "only the parent or grandparent class.\n\n"
+        "Possible judgments:\n\n"
+        '"0": The response does not match the ground-truth answer.\n'
+        '"1": The response matches the ground-truth.\n\n'
+        f'Question: "{question}"\n'
+        f'Ground truth: "{ground_truth}"\n'
+        f"{evidence}\n"
         f'Response: "{rollout_text}"\n\n'
         "Your job is to ONLY check whether the given response matches "
         "the ground truth answer or not in the context of the question. "
