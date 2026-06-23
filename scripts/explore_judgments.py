@@ -17,6 +17,8 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+from oven_mllm_eval.judge_audit import IDK_VARIANTS, build_alias_map, classify_positive
+
 
 # Streamlit is imported inside main() so the --help flag works without it installed.
 
@@ -37,11 +39,22 @@ def main():
                         help="Path to _scored.jsonl")
     parser.add_argument("--max-examples", type=int, default=None,
                         help="Limit examples loaded (for faster startup)")
+    parser.add_argument("--taxonomy-index",
+                        default="data/processed/oven_taxonomy_index.json",
+                        help="Taxonomy index for alias-aware support classification "
+                             "(optional; alias matching is skipped if missing)")
     args, _ = parser.parse_known_args()
 
     if not args.scored:
         print("Usage: --scored <path> or set EXPLORE_SCORED env var")
         sys.exit(1)
+
+    # Load alias map once for classify_positive (degrades gracefully if absent).
+    index_path = Path(args.taxonomy_index)
+    aliases_by_canonical = (
+        build_alias_map(json.loads(index_path.read_text()))
+        if index_path.is_file() else {}
+    )
 
     import streamlit as st
 
@@ -82,7 +95,7 @@ def main():
     question_filter = st.sidebar.selectbox("Question template", ["all"] + questions)
 
     # ── Apply filters ───────────────────────────────────────────────
-    IDK = {"i don't know", "i don't know.", "i don't know,", "i dont know", "i dont know."}
+    IDK = IDK_VARIANTS
 
     filtered = []
     for r in rows:
@@ -201,15 +214,14 @@ def main():
         gt = r.get("answer", "")
         st.write("**🔍 Prediction vs Ground Truth:**")
 
-        # Simple check: does the prediction match the GT?
-        pred_norm = pred.strip().lower().rstrip(".")
-        gt_norm = gt.strip().lower().rstrip(".")
-        match = pred_norm == gt_norm or gt_norm in pred_norm or pred_norm in gt_norm
-
-        if match:
-            st.success(f"Prediction: `{pred}`")
+        # Mechanical support check — same classifier the batch auditor uses.
+        support = classify_positive(
+            prediction=pred, answer=gt, aliases_by_canonical=aliases_by_canonical
+        )
+        if support is not None:
+            st.success(f"Prediction: `{pred}`  _(supported: {support})_")
         else:
-            st.error(f"Prediction: `{pred}`")
+            st.error(f"Prediction: `{pred}`  _(no mechanical support)_")
         st.write(f"Ground truth: `{gt}`")
     with col_b:
         v = r.get("judge_verdicts", [])

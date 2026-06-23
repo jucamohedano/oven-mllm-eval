@@ -11,17 +11,12 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import re
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
-
-def normalize(text: str) -> str:
-    text = text.lower().strip()
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = re.sub(r"[^a-z0-9]+", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
+from oven_mllm_eval.judge_audit import build_alias_map, classify_positive
+from oven_mllm_eval.pass_at_k import pass_at_k
 
 
 def load_jsonl(path: Path):
@@ -44,51 +39,6 @@ def find_scored_inputs(paths: list[str]) -> list[Path]:
         else:
             raise FileNotFoundError(raw)
     return sorted(set(scored))
-
-
-def pass_at_k(n: int, c: int, k: int) -> float:
-    if n <= 0 or c <= 0:
-        return 0.0
-    if k >= n:
-        return 1.0
-    if n - c < k:
-        return 1.0
-
-    miss_prob = 1.0
-    for i in range(k):
-        miss_prob *= (n - c - i) / (n - i)
-    return 1.0 - miss_prob
-
-
-def build_alias_map(index: dict[str, Any]) -> dict[str, set[str]]:
-    aliases_by_canonical: dict[str, set[str]] = {}
-    for alias_norm, canonical in index.get("aliases", {}).items():
-        aliases_by_canonical.setdefault(normalize(canonical), set()).add(alias_norm)
-    return aliases_by_canonical
-
-
-def classify_positive(
-    *,
-    prediction: str,
-    answer: str,
-    aliases_by_canonical: dict[str, set[str]],
-) -> str | None:
-    pred_norm = normalize(prediction)
-    answer_norm = normalize(answer)
-
-    if pred_norm == answer_norm:
-        return "exact"
-
-    if pred_norm in aliases_by_canonical.get(answer_norm, set()):
-        return "alias"
-
-    if answer_norm and answer_norm in pred_norm:
-        return "contains_answer"
-
-    if pred_norm and pred_norm in answer_norm:
-        return "answer_contains_prediction"
-
-    return None
 
 
 def audit_file(
