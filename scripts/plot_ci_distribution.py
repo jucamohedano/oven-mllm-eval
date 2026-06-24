@@ -29,6 +29,8 @@ from pathlib import Path
 
 import numpy as np
 
+from oven_mllm_eval.judge_audit import build_alias_map, classify_positive, is_supported
+
 
 def _model_label_from_path(path: str) -> str:
     m = re.search(r"qwen_qwen3-vl-(\d+b)", path)
@@ -45,27 +47,62 @@ def _find_scored(run_dir: Path) -> Path | None:
     return None
 
 
-def _load_ci(path: str) -> tuple[list[int], int, int]:
-    """Return (all_ci, num_solved, total_examples)."""
+def _supported_ci(row: dict, aliases_by_canonical: dict[str, set[str]]) -> int:
+    answer = row.get("answer", "")
+    texts = row.get("all_texts", [])
+    verdicts = row.get("judge_verdicts", [])
+    return sum(
+        1
+        for text, verdict in zip(texts, verdicts)
+        if verdict
+        and is_supported(
+            classify_positive(
+                prediction=text,
+                answer=answer,
+                aliases_by_canonical=aliases_by_canonical,
+            )
+        )
+    )
+
+
+def _load_ci(
+    path: str,
+    aliases_by_canonical: dict[str, set[str]] | None = None,
+) -> tuple[list[int], list[int], int, int, int]:
+    """Return (judge_ci, supported_ci, judge_solved, supported_solved, total_examples)."""
+    aliases_by_canonical = aliases_by_canonical or {}
+    compute_supported = bool(aliases_by_canonical)
     ci_vals: list[int] = []
+    supported_vals: list[int] = []
     with open(path) as f:
         for line in f:
             r = json.loads(line.strip())
             v = r.get("judge_verdicts", [])
             if v:
                 ci_vals.append(sum(v))
+                supported_vals.append(
+                    _supported_ci(r, aliases_by_canonical) if compute_supported else 0
+                )
     solved = sum(1 for c in ci_vals if c >= 1)
-    return ci_vals, solved, len(ci_vals)
+    supported_solved = sum(1 for c in supported_vals if c >= 1)
+    return ci_vals, supported_vals, solved, supported_solved, len(ci_vals)
 
 
-def _load_data_id_map(path: str) -> dict[str, int]:
+def _load_data_id_map(
+    path: str,
+    *,
+    supported: bool,
+    aliases_by_canonical: dict[str, set[str]],
+) -> dict[str, int]:
     result: dict[str, int] = {}
     with open(path) as f:
         for line in f:
             r = json.loads(line.strip())
             v = r.get("judge_verdicts", [])
             if v:
-                result[r["data_id"]] = sum(v)
+                result[r["data_id"]] = (
+                    _supported_ci(r, aliases_by_canonical) if supported else sum(v)
+                )
     return result
 
 
@@ -79,9 +116,26 @@ def main():
                         help="Path to 4B _scored.jsonl (or directory)")
     parser.add_argument("--scored-8b", required=True,
                         help="Path to 8B _scored.jsonl (or directory)")
+    parser.add_argument(
+        "--taxonomy-index",
+        default="data/processed/oven_taxonomy_index.json",
+        help="Taxonomy index with aliases for supported-cᵢ checks",
+    )
+    parser.add_argument(
+        "--supported",
+        action="store_true",
+        help="Plot supported cᵢ instead of judge cᵢ.",
+    )
     parser.add_argument("--output", default="viz/ci_distribution.png")
     parser.add_argument("--title", default=None)
     args = parser.parse_args()
+
+    aliases_by_canonical = {}
+    if args.supported:
+        index = json.loads(Path(args.taxonomy_index).read_text())
+        aliases_by_canonical = build_alias_map(index)
+    ci_key = "supported_ci_all" if args.supported else "ci_all"
+    ci_label = "supported-cᵢ" if args.supported else "judge-cᵢ"
 
     # Resolve paths
     models: dict[str, dict] = {}
@@ -92,22 +146,43 @@ def main():
             if not f:
                 print(f"Error: no scored file in {p}"); return
             p = f
-        ci_all, solved, total = _load_ci(str(p))
+        ci_all, supported_ci_all, solved, supported_solved, total = _load_ci(
+            str(p),
+            aliases_by_canonical,
+        )
         models[size] = {
             "ci_all": ci_all,
+            "supported_ci_all": supported_ci_all,
             "solved": solved,
+            "supported_solved": supported_solved,
             "total": total,
             "label": _model_label_from_path(str(p)),
             "path": str(p),
         }
+        active_ci = models[size][ci_key]
+        active_solved = sum(1 for c in active_ci if c >= 1)
         print(f"  {models[size]['label']}: {total} examples, "
               f"solved={solved} ({solved/total*100:.1f}%), "
-              f"mean_cᵢ={np.mean(ci_all):.1f}")
+              f"supported_solved={supported_solved} ({supported_solved/total*100:.1f}%), "
+              f"plotted_solved={active_solved} ({active_solved/total*100:.1f}%), "
+              f"mean_{ci_label}={np.mean(active_ci):.1f}")
 
     # Differentials
-    ci_2b_map = _load_data_id_map(models["2B"]["path"])
-    ci_4b_map = _load_data_id_map(models["4B"]["path"])
-    ci_8b_map = _load_data_id_map(models["8B"]["path"])
+    ci_2b_map = _load_data_id_map(
+        models["2B"]["path"],
+        supported=args.supported,
+        aliases_by_canonical=aliases_by_canonical,
+    )
+    ci_4b_map = _load_data_id_map(
+        models["4B"]["path"],
+        supported=args.supported,
+        aliases_by_canonical=aliases_by_canonical,
+    )
+    ci_8b_map = _load_data_id_map(
+        models["8B"]["path"],
+        supported=args.supported,
+        aliases_by_canonical=aliases_by_canonical,
+    )
     common_28 = set(ci_2b_map) & set(ci_8b_map)
     common_24 = set(ci_2b_map) & set(ci_4b_map)
 
@@ -150,7 +225,7 @@ def main():
     # ── Left: Histogram of cᵢ | cᵢ ≥ 1 (as % of solved examples) ──
     all_pct_max = 0
     for idx, size in enumerate(order):
-        ci_pos = [c for c in models[size]["ci_all"] if c >= 1]
+        ci_pos = [c for c in models[size][ci_key] if c >= 1]
         n_solved = len(ci_pos)
         pcts = [sum(1 for c in ci_pos if bin_edges[i] <= c < bin_edges[i+1]) / n_solved * 100
                 for i in range(len(bin_edges) - 1)]
@@ -164,9 +239,9 @@ def main():
                              f"{pct:.1f}%", ha="center", va="bottom", fontsize=6,
                              fontweight="bold", color=colors[size])
 
-    ax_hist.set_xlabel("cᵢ (correct rollouts out of 256)", fontsize=11)
+    ax_hist.set_xlabel(f"{ci_label} out of 256", fontsize=11)
     ax_hist.set_ylabel("% of solved examples", fontsize=11)
-    ax_hist.set_title("Histogram of cᵢ | cᵢ ≥ 1", fontsize=12)
+    ax_hist.set_title(f"Histogram of {ci_label} | {ci_label} ≥ 1", fontsize=12)
     ax_hist.set_xticks(x)
     ax_hist.set_xticklabels(bin_labels, fontsize=9)
     ax_hist.legend(fontsize=9)
@@ -174,7 +249,7 @@ def main():
 
     # ── Right: CDF ──
     for size in order:
-        ci_pos = sorted([c for c in models[size]["ci_all"] if c >= 1])
+        ci_pos = sorted([c for c in models[size][ci_key] if c >= 1])
         if not ci_pos:
             continue
         t = np.arange(1, max(ci_pos) + 1)
@@ -194,9 +269,9 @@ def main():
                     label=f"2B wins, {name} misses (n={len(d)})",
                     color=diff_colors[name], alpha=0.85)
 
-    ax_cdf.set_xlabel("t (cᵢ ≤ t)", fontsize=11)
+    ax_cdf.set_xlabel(f"t ({ci_label} ≤ t)", fontsize=11)
     ax_cdf.set_ylabel("Fraction of solved examples", fontsize=11)
-    ax_cdf.set_title("CDF of cᵢ | cᵢ ≥ 1", fontsize=12)
+    ax_cdf.set_title(f"CDF of {ci_label} | {ci_label} ≥ 1", fontsize=12)
     ax_cdf.legend(fontsize=8.5)
     ax_cdf.set_xscale("log", base=2)
     ax_cdf.set_xlim(1, 256)
@@ -205,12 +280,12 @@ def main():
     # Stats annotation
     stats_lines = []
     for size in order:
-        ci_pos = [c for c in models[size]["ci_all"] if c >= 1]
+        ci_pos = [c for c in models[size][ci_key] if c >= 1]
         s1 = sum(1 for c in ci_pos if c == 1) / len(ci_pos) * 100
         s2 = sum(1 for c in ci_pos if c <= 2) / len(ci_pos) * 100
         s4 = sum(1 for c in ci_pos if c <= 4) / len(ci_pos) * 100
         stats_lines.append(
-            f"{models[size]['label']}: cᵢ=1 {s1:.0f}%,  cᵢ≤2 {s2:.0f}%,  cᵢ≤4 {s4:.0f}%"
+            f"{models[size]['label']}: {ci_label}=1 {s1:.0f}%,  {ci_label}≤2 {s2:.0f}%,  {ci_label}≤4 {s4:.0f}%"
         )
     for name, d in diffs.items():
         if not d:
@@ -220,7 +295,7 @@ def main():
         s2d = sum(1 for c in d if c <= 2) / n * 100
         s4d = sum(1 for c in d if c <= 4) / n * 100
         stats_lines.append(
-            f"Δ 2B wins/{name} misses: cᵢ=1 {s1d:.0f}%,  cᵢ≤2 {s2d:.0f}%,  cᵢ≤4 {s4d:.0f}%"
+            f"Δ 2B wins/{name} misses: {ci_label}=1 {s1d:.0f}%,  {ci_label}≤2 {s2d:.0f}%,  {ci_label}≤4 {s4d:.0f}%"
         )
     ax_cdf.text(0.98, 0.05, "\n".join(stats_lines), transform=ax_cdf.transAxes,
                 fontsize=7.5, verticalalignment="bottom", horizontalalignment="right",
