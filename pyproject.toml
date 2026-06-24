@@ -29,6 +29,13 @@ analysis = [
     "seaborn>=0.13",
     "pyvis>=0.3",
 ]
+# For semantic (cosine) taxonomy mapping — the 'sentence_bert' measure.
+# Install with:  uv sync --extra embed
+# Then download the model:  hf download sentence-transformers/all-mpnet-base-v2
+embed = [
+    "sentence-transformers>=3.0",
+    "numpy>=1.26",
+]
 dev = [
     "pytest>=8",
     "ruff>=0.6",

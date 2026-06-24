@@ -143,6 +143,71 @@ def _score_rows(
     return scored_rows, accum
 
 
+def _extract_prediction(row: dict) -> str:
+    """Authoritative prediction string (mirrors the priority in _score_rows)."""
+    return (row.get("judge_selected_text")
+            or row.get("prediction")
+            or row.get("iter_final_prediction")
+            or row.get("output", ""))
+
+
+def _score_embedding(scored_rows: list[dict], index: dict,
+                     mapping: dict[str, dict]) -> tuple[dict, dict]:
+    """Annotate rows with ``sentence_bert_*`` fields from a precomputed mapping.
+
+    The expensive embed + cascade already ran once per unique prediction
+    (``mapping``); here we only join it back and compute hP/hR/hF per row
+    (cheap — the reference path differs per example).
+    """
+    from oven_mllm_eval.scores import calc_hierarchical_metrics
+    from oven_mllm_eval.matching import _normalise
+
+    n2p = index.get("node_to_path", {})
+    eid2p = index.get("entity_id_to_path", {})
+    accum = {"hP": [], "hR": [], "hF": [], "exact": [], "mapped": 0}
+    method_counts: dict = {}
+
+    for row in scored_rows:
+        answer = (row.get("answer", "")
+                  .replace("A: ", "").replace("A:", "")
+                  .replace("<answer>", "").replace("</answer>", "")
+                  .replace("<s>", "").replace("</s>", "")
+                  .strip())
+        entity_id = row.get("entity_id")
+        ref_path = n2p.get(answer) or (eid2p.get(entity_id) if entity_id else None)
+
+        m = mapping.get(_extract_prediction(row)) or {}
+        method = m.get("mapping_method")
+        method_counts[method] = method_counts.get(method, 0) + 1
+        pred_node = m.get("predicted_node")
+        pred_path = m.get("predicted_path")
+
+        if pred_path is not None and ref_path is not None:
+            mt = calc_hierarchical_metrics([(pred_path, ref_path)])
+            hP, hR, hF = mt["hP"][0], mt["hR"][0], mt["hF"][0]
+            exact = _normalise(pred_node or "") == _normalise(answer)
+            accum["hP"].append(hP)
+            accum["hR"].append(hR)
+            accum["hF"].append(hF)
+            accum["exact"].append(int(exact))
+            accum["mapped"] += 1
+        else:
+            hP = hR = hF = 0.0
+            exact = False
+
+        row.update({
+            "sentence_bert_predicted_node": pred_node,
+            "sentence_bert_predicted_path": pred_path,
+            "sentence_bert_hP": hP,
+            "sentence_bert_hR": hR,
+            "sentence_bert_hF": hF,
+            "sentence_bert_exact_match": exact,
+            "sentence_bert_mapping_method": method,
+        })
+
+    return accum, method_counts
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -154,6 +219,10 @@ def score_generation_file(
     summary_path: Optional[str | Path] = None,
     measure: str | Sequence[str] = "exact_match",
     num_workers: int = 1,
+    embed_model: str = "sentence-transformers/all-mpnet-base-v2",
+    map_top_k: int = 3,
+    map_min_score: float = 0.35,
+    embed_device: str = "cpu",
 ) -> dict | list[dict]:
     """Score a generation JSONL file with one or more pluggable measures.
 
@@ -207,10 +276,17 @@ def score_generation_file(
     else:
         measure_names = list(measure)
 
-    for m in measure_names:
+    # "sentence_bert" is the cosine-retrieval path (not a per-row ALL_MEASURES
+    # entry); it is handled separately below.
+    EMBED_MEASURE = "sentence_bert"
+    do_embed = EMBED_MEASURE in measure_names
+    lexical_names = [m for m in measure_names if m != EMBED_MEASURE]
+
+    for m in lexical_names:
         if m not in ALL_MEASURES:
             raise ValueError(
-                f"Unknown measure '{m}'. Available: {list(ALL_MEASURES.keys())}"
+                f"Unknown measure '{m}'. Available: "
+                f"{list(ALL_MEASURES.keys()) + [EMBED_MEASURE]}"
             )
 
     input_path = Path(input_path)
@@ -243,37 +319,55 @@ def score_generation_file(
                 continue
             rows.append(json.loads(line))
 
-    # Score — parallel or serial
-    if num_workers > 1:
-        # Contiguous chunks of roughly equal size.  All rows do the same
-        # work (one prediction vs ~12K node labels), so round-robin isn't
-        # needed — and contiguous chunks preserve row order in output.
-        chunk_size = (len(rows) + num_workers - 1) // num_workers
-        chunks = [rows[i:i + chunk_size] for i in range(0, len(rows), chunk_size)]
-        args = [(chunk, measure_names, resolved_index_path) for chunk in chunks]
-
-        try:
-            with multiprocessing.Pool(num_workers) as pool:
-                results = pool.map(_score_rows, args)
-        except Exception:
-            logger.warning(
-                "multiprocessing.Pool.map failed — falling back to serial. "
-                "Error details:", exc_info=True,
-            )
-            results = [_score_rows((rows, measure_names, resolved_index_path))]
-    else:
-        results = [_score_rows((rows, measure_names, resolved_index_path))]
-
-    # Merge results from all chunks
+    # Score lexical measures — parallel or serial
     accum = {m: {"hP": [], "hR": [], "hF": [], "exact": [], "mapped": 0}
-             for m in measure_names}
-    scored_rows = []
-    for chunk_rows, chunk_accum in results:
-        scored_rows.extend(chunk_rows)
-        for m in measure_names:
-            for key in ("hP", "hR", "hF", "exact"):
-                accum[m][key].extend(chunk_accum[m][key])
-            accum[m]["mapped"] += chunk_accum[m]["mapped"]
+             for m in lexical_names}
+    if lexical_names:
+        if num_workers > 1:
+            # Contiguous chunks of roughly equal size.  All rows do the same
+            # work (one prediction vs ~12K node labels), so round-robin isn't
+            # needed — and contiguous chunks preserve row order in output.
+            chunk_size = (len(rows) + num_workers - 1) // num_workers
+            chunks = [rows[i:i + chunk_size] for i in range(0, len(rows), chunk_size)]
+            args = [(chunk, lexical_names, resolved_index_path) for chunk in chunks]
+
+            try:
+                with multiprocessing.Pool(num_workers) as pool:
+                    results = pool.map(_score_rows, args)
+            except Exception:
+                logger.warning(
+                    "multiprocessing.Pool.map failed — falling back to serial. "
+                    "Error details:", exc_info=True,
+                )
+                results = [_score_rows((rows, lexical_names, resolved_index_path))]
+        else:
+            results = [_score_rows((rows, lexical_names, resolved_index_path))]
+
+        scored_rows = []
+        for chunk_rows, chunk_accum in results:
+            scored_rows.extend(chunk_rows)
+            for m in lexical_names:
+                for key in ("hP", "hR", "hF", "exact"):
+                    accum[m][key].extend(chunk_accum[m][key])
+                accum[m]["mapped"] += chunk_accum[m]["mapped"]
+    else:
+        scored_rows = [dict(r) for r in rows]
+
+    # Score the embedding measure (cosine retrieval → cascade), single pass.
+    embed_method_counts: dict | None = None
+    if do_embed:
+        from oven_mllm_eval.taxonomy import load_taxonomy_index
+        from oven_mllm_eval.embedding_matcher import build_prediction_mapping
+
+        _index = load_taxonomy_index(resolved_index_path)
+        _preds = [_extract_prediction(r) for r in scored_rows]
+        _mapping = build_prediction_mapping(
+            _preds, _index, model_name=embed_model, k=map_top_k,
+            min_score=map_min_score, device=embed_device,
+        )
+        accum[EMBED_MEASURE], embed_method_counts = _score_embedding(
+            scored_rows, _index, _mapping
+        )
 
     # Aggregate per measure
     summaries = []
@@ -294,6 +388,13 @@ def score_generation_file(
                 "num_examples": len(scored_rows), "num_mapped": 0,
             }
         summaries.append({"measure": matcher_name, "metrics": s})
+
+    # Attach mapping-method breakdown (exact / ngram / voting / top_score /
+    # none) to the embedding measure for auditability.
+    if embed_method_counts is not None:
+        for _s in summaries:
+            if _s["measure"] == EMBED_MEASURE:
+                _s["metrics"]["mapping_methods"] = embed_method_counts
 
     # ── pass@k from judge verdicts ──────────────────────────────────
     # Uses the numerically stable product-form estimator:
