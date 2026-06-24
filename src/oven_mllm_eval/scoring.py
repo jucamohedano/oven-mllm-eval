@@ -90,13 +90,24 @@ def _score_rows(
                   .replace("<answer>", "").replace("</answer>", "")
                   .replace("<s>", "").replace("</s>", "")
                   .strip())
-        # judge_selected_text is the authoritative prediction when the
-        # judge ran (Phase 2); fall back to raw prediction for backward
-        # compatibility with pre-judge runs.
-        prediction = (row.get("judge_selected_text")
-                      or row.get("prediction")
-                      or row.get("iter_final_prediction")
-                      or row.get("output", ""))
+        # Candidate answers: the UNIQUE answers the judge tagged correct (the
+        # judge prunes the answer space).  Among them we report the best-
+        # mapping one per measure — more robust than the arbitrary first
+        # correct rollout, which may be an unmappable paraphrase.  Fall back to
+        # the single judge-selected / raw prediction when the judge tagged
+        # nothing correct (or did not run).
+        verdicts = row.get("judge_verdicts") or []
+        all_texts = row.get("all_texts") or []
+        candidates = list(dict.fromkeys(
+            all_texts[j]
+            for j in range(min(len(all_texts), len(verdicts)))
+            if verdicts[j]
+        ))
+        if not candidates:
+            candidates = [(row.get("judge_selected_text")
+                           or row.get("prediction")
+                           or row.get("iter_final_prediction")
+                           or row.get("output", ""))]
         entity_id = row.get("entity_id")
 
         # Look up reference path once (shared across measures)
@@ -112,7 +123,12 @@ def _score_rows(
 
         scored_row = {**row}
         for matcher_name, matcher in matchers.items():
-            result = matcher.evaluate(prediction, answer, reference_path=ref_path)
+            # Best of the judge-correct candidates by hF for this measure.
+            result = None
+            for cand in candidates:
+                r = matcher.evaluate(cand, answer, reference_path=ref_path)
+                if result is None or r["hF"] > result["hF"]:
+                    result = r
 
             prefix = matcher_name
             scored_row.update({
@@ -143,21 +159,17 @@ def _score_rows(
     return scored_rows, accum
 
 
-def _extract_prediction(row: dict) -> str:
-    """Authoritative prediction string (mirrors the priority in _score_rows)."""
-    return (row.get("judge_selected_text")
-            or row.get("prediction")
-            or row.get("iter_final_prediction")
-            or row.get("output", ""))
+def _score_rollouts(scored_rows: list[dict], index: dict,
+                    mapping: dict[str, dict]) -> tuple[dict, dict]:
+    """Best-of-N hierarchical scoring over a sample's rollouts.
 
+    For each example, every rollout in ``all_texts`` is mapped to a node (via
+    the precomputed ``mapping``) and scored against the reference path; the
+    rollout with the highest hF is selected and *its* (hP, hR, hF) reported.
+    The expensive embed + cascade already ran once per unique rollout string.
 
-def _score_embedding(scored_rows: list[dict], index: dict,
-                     mapping: dict[str, dict]) -> tuple[dict, dict]:
-    """Annotate rows with ``sentence_bert_*`` fields from a precomputed mapping.
-
-    The expensive embed + cascade already ran once per unique prediction
-    (``mapping``); here we only join it back and compute hP/hR/hF per row
-    (cheap — the reference path differs per example).
+    (The distribution mean — the honest counterpart to this oracle ceiling — is
+    a future TODO; see docs/rollout-hierarchical-metrics.md.)
     """
     from oven_mllm_eval.scores import calc_hierarchical_metrics
     from oven_mllm_eval.matching import _normalise
@@ -175,16 +187,29 @@ def _score_embedding(scored_rows: list[dict], index: dict,
                   .strip())
         entity_id = row.get("entity_id")
         ref_path = n2p.get(answer) or (eid2p.get(entity_id) if entity_id else None)
+        texts = row.get("all_texts") or []
 
-        m = mapping.get(_extract_prediction(row)) or {}
-        method = m.get("mapping_method")
+        # Best-of-N: score each unique rollout once, keep the highest-hF one.
+        # Any mapped prediction shares the root → hF > 0, so the argmax always
+        # prefers a mapped rollout over an unmapped one (hF = 0).
+        best = None  # (hF, hP, hR, node, path, method)
+        for t in set(texts):
+            m = mapping.get(t) or {}
+            pp = m.get("predicted_path")
+            if pp is not None and ref_path is not None:
+                mt = calc_hierarchical_metrics([(pp, ref_path)])
+                hP, hR, hF = mt["hP"][0], mt["hR"][0], mt["hF"][0]
+            else:
+                hP = hR = hF = 0.0
+            if best is None or hF > best[0]:
+                best = (hF, hP, hR, m.get("predicted_node"), pp, m.get("mapping_method"))
+
+        if best is None:  # no rollouts
+            best = (0.0, 0.0, 0.0, None, None, None)
+        hF, hP, hR, pred_node, pred_path, method = best
         method_counts[method] = method_counts.get(method, 0) + 1
-        pred_node = m.get("predicted_node")
-        pred_path = m.get("predicted_path")
 
         if pred_path is not None and ref_path is not None:
-            mt = calc_hierarchical_metrics([(pred_path, ref_path)])
-            hP, hR, hF = mt["hP"][0], mt["hR"][0], mt["hF"][0]
             exact = _normalise(pred_node or "") == _normalise(answer)
             accum["hP"].append(hP)
             accum["hR"].append(hR)
@@ -192,17 +217,16 @@ def _score_embedding(scored_rows: list[dict], index: dict,
             accum["exact"].append(int(exact))
             accum["mapped"] += 1
         else:
-            hP = hR = hF = 0.0
             exact = False
 
         row.update({
-            "sentence_bert_predicted_node": pred_node,
-            "sentence_bert_predicted_path": pred_path,
-            "sentence_bert_hP": hP,
-            "sentence_bert_hR": hR,
-            "sentence_bert_hF": hF,
-            "sentence_bert_exact_match": exact,
-            "sentence_bert_mapping_method": method,
+            "cascade_predicted_node": pred_node,
+            "cascade_predicted_path": pred_path,
+            "cascade_hP": hP,
+            "cascade_hR": hR,
+            "cascade_hF": hF,
+            "cascade_exact_match": exact,
+            "cascade_mapping_method": method,
         })
 
     return accum, method_counts
@@ -223,6 +247,7 @@ def score_generation_file(
     map_top_k: int = 3,
     map_min_score: float = 0.35,
     embed_device: str = "cpu",
+    max_examples: int | None = None,
 ) -> dict | list[dict]:
     """Score a generation JSONL file with one or more pluggable measures.
 
@@ -276,9 +301,9 @@ def score_generation_file(
     else:
         measure_names = list(measure)
 
-    # "sentence_bert" is the cosine-retrieval path (not a per-row ALL_MEASURES
-    # entry); it is handled separately below.
-    EMBED_MEASURE = "sentence_bert"
+    # "cascade" is the cascading mapping algorithm (cosine top-k retrieval →
+    # exact/n-gram/voting); not a per-row ALL_MEASURES entry, handled separately.
+    EMBED_MEASURE = "cascade"
     do_embed = EMBED_MEASURE in measure_names
     lexical_names = [m for m in measure_names if m != EMBED_MEASURE]
 
@@ -318,6 +343,8 @@ def score_generation_file(
             if not line:
                 continue
             rows.append(json.loads(line))
+            if max_examples and len(rows) >= max_examples:
+                break  # quick-test cap — stop reading early
 
     # Score lexical measures — parallel or serial
     accum = {m: {"hP": [], "hR": [], "hF": [], "exact": [], "mapped": 0}
@@ -360,12 +387,14 @@ def score_generation_file(
         from oven_mllm_eval.embedding_matcher import build_prediction_mapping
 
         _index = load_taxonomy_index(resolved_index_path)
-        _preds = [_extract_prediction(r) for r in scored_rows]
+        # Best-of-N: map every rollout (deduped internally by build_prediction_mapping),
+        # not a single representative prediction.
+        _rollouts = [t for r in scored_rows for t in (r.get("all_texts") or [])]
         _mapping = build_prediction_mapping(
-            _preds, _index, model_name=embed_model, k=map_top_k,
+            _rollouts, _index, model_name=embed_model, k=map_top_k,
             min_score=map_min_score, device=embed_device,
         )
-        accum[EMBED_MEASURE], embed_method_counts = _score_embedding(
+        accum[EMBED_MEASURE], embed_method_counts = _score_rollouts(
             scored_rows, _index, _mapping
         )
 
@@ -395,6 +424,7 @@ def score_generation_file(
         for _s in summaries:
             if _s["measure"] == EMBED_MEASURE:
                 _s["metrics"]["mapping_methods"] = embed_method_counts
+                _s["metrics"]["selection"] = "best_of_n"
 
     # ── pass@k from judge verdicts ──────────────────────────────────
     # Uses the numerically stable product-form estimator:
