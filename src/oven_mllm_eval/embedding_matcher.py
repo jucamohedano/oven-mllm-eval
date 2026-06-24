@@ -4,7 +4,7 @@ Builds and caches sentence-embedding vectors for all taxonomy node labels,
 then retrieves the top-k nearest nodes for a batch of predictions.  The
 retrieved top-k are fed into ``TaxonomyMatcher``'s cascade (exact / n-gram /
 voting) — this module only replaces the cascade's lexical Step 1 with cosine
-retrieval, matching the CVPR 2025 reference (``sentence_bert`` measure).
+retrieval, matching the CVPR 2025 reference (the ``cascade`` measure).
 
 Node embeddings are computed once and cached to disk (keyed by model + the
 node set), so the expensive encode runs a single time across all runs.
@@ -13,11 +13,14 @@ node set), so the expensive encode runs a single time across all runs.
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 
 import numpy as np
 
 DEFAULT_MODEL = "sentence-transformers/all-mpnet-base-v2"
+# Cache location precedence: explicit arg → $OVEN_NODE_EMB_DIR → repo-local default.
+# On the cluster point $OVEN_NODE_EMB_DIR at $WORK so the cache is off the (full) FAST scratch.
 DEFAULT_CACHE_DIR = "data/processed/node_emb"
 
 
@@ -34,7 +37,8 @@ class EmbeddingNodeIndex:
         self.all_nodes = list(all_nodes)
         self.model_name = model_name
         self.device = device
-        self.cache_dir = Path(cache_dir or DEFAULT_CACHE_DIR)
+        self.cache_dir = Path(cache_dir or os.environ.get("OVEN_NODE_EMB_DIR")
+                              or DEFAULT_CACHE_DIR)
         self._model = None
         self.node_emb = self._build_or_load()
 
@@ -49,7 +53,7 @@ class EmbeddingNodeIndex:
                 from sentence_transformers import SentenceTransformer
             except ImportError as e:  # pragma: no cover
                 raise ImportError(
-                    "sentence-transformers is required for the 'sentence_bert' "
+                    "sentence-transformers is required for the 'cascade' measure "
                     "measure. Install it with `uv sync` (it is declared in "
                     "pyproject.toml) and download the model with "
                     f"`hf download {self.model_name}`."
@@ -60,7 +64,11 @@ class EmbeddingNodeIndex:
     def _build_or_load(self) -> np.ndarray:
         cp = self._cache_path()
         if cp.exists():
-            return np.load(cp)
+            try:
+                return np.load(cp)
+            except (OSError, ValueError) as e:  # corrupt/partial cache → recompute
+                print(f"[embed] WARNING: cached {cp} unreadable ({e}); recomputing.",
+                      flush=True)
         model = self._load_model()
         print(f"[embed] encoding {len(self.all_nodes):,} taxonomy nodes "
               f"with {self.model_name} (one-time, caching to {cp})", flush=True)
@@ -71,8 +79,19 @@ class EmbeddingNodeIndex:
             convert_to_numpy=True,
             show_progress_bar=True,
         )
-        cp.parent.mkdir(parents=True, exist_ok=True)
-        np.save(cp, emb)
+        # Best-effort cache: a write failure (e.g. full/over-quota filesystem)
+        # must not kill scoring.  Write atomically so a failed write never
+        # leaves a corrupt cache for the next run.
+        try:
+            cp.parent.mkdir(parents=True, exist_ok=True)
+            tmp = cp.parent / (cp.name + ".tmp")
+            with open(tmp, "wb") as f:
+                np.save(f, emb)
+            tmp.replace(cp)
+        except OSError as e:
+            print(f"[embed] WARNING: could not cache node embeddings to {cp} ({e}); "
+                  f"continuing without the cache (set $OVEN_NODE_EMB_DIR to a writable "
+                  f"location to enable caching).", flush=True)
         return emb
 
     def search(self, predictions: list[str], k: int = 3) -> list[tuple[list[int], list[float]]]:
