@@ -17,7 +17,11 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-from oven_mllm_eval.judge_audit import IDK_VARIANTS, build_alias_map, classify_positive
+from oven_mllm_eval.judge_audit import (
+    build_alias_map,
+    classify_positive,
+    is_supported,
+)
 
 
 # Streamlit is imported inside main() so the --help flag works without it installed.
@@ -56,6 +60,8 @@ def main():
         if index_path.is_file() else {}
     )
 
+    import altair as alt
+    import pandas as pd
     import streamlit as st
 
     st.set_page_config(page_title="Judge Verdict Explorer", layout="wide")
@@ -69,213 +75,183 @@ def main():
     st.sidebar.title("Data")
     st.sidebar.write(f"Loaded {len(rows):,} examples")
 
-    # ── Filters ─────────────────────────────────────────────────────
+    # ── Support classification of judge-hit examples ────────────────
+    # Classify each judge-positive example by its judge-selected prediction,
+    # using the same rule as the audit (is_supported / under-specific). This is
+    # what surfaces the note-001 mechanism: under-specific = hypernym answers the
+    # judge accepted but that are NOT counted as supported.
+    def _selected_pred(r):
+        return r.get("judge_selected_text") or r.get("prediction") or ""
+
+    support_by_id = {
+        r["data_id"]: classify_positive(
+            prediction=_selected_pred(r),
+            answer=r.get("answer", ""),
+            aliases_by_canonical=aliases_by_canonical,
+        )
+        for r in rows
+        if any(r.get("judge_verdicts", []))
+    }
+    n_hit = len(support_by_id)
+    n_supp = sum(1 for c in support_by_id.values() if is_supported(c))
+    n_under = sum(1 for c in support_by_id.values() if c == "answer_contains_prediction")
+    n_unsupp = n_hit - n_supp - n_under
+    if n_hit:
+        st.sidebar.caption(
+            f"**Judge hits: {n_hit:,}** (by selected prediction)\n\n"
+            f"✅ supported: {n_supp:,} ({n_supp/n_hit:.1%})\n\n"
+            f"⚠️ under-specific: {n_under:,} ({n_under/n_hit:.1%})\n\n"
+            f"❌ unsupported: {n_unsupp:,} ({n_unsupp/n_hit:.1%})"
+        )
+
+    # ── Filters (only the three that matter) ────────────────────────
     st.sidebar.title("Filters")
-
-    # Build filterable fields
-    entities = sorted(set(r.get("entity_text", "") for r in rows))
-    questions = sorted(set(r.get("question", "") for r in rows))
-
+    filter_hit = st.sidebar.radio("Judge result", ["all", "hit", "miss"], horizontal=True)
+    support_filter = st.sidebar.selectbox(
+        "Support class (judge hits)",
+        ["all", "supported", "under-specific (hypernym)", "unsupported"],
+        help="How the judge-selected prediction relates to the ground truth. "
+             "'under-specific' = prediction ⊆ GT (the note-001 mechanism).",
+    )
     search = st.sidebar.text_input("Search answer / rollout text", "")
 
-    filter_hit = st.sidebar.selectbox(
-        "Judge result", ["all", "correct (hit)", "wrong (miss)"]
-    )
-    judge_hit_target = {"correct (hit)": True, "wrong (miss)": False}.get(filter_hit)
-
-    min_ci = st.sidebar.slider("Min cᵢ (correct rollouts)", 0, 256, 0, step=1)
-    max_ci = st.sidebar.slider("Max cᵢ", 0, 256, 256, step=1)
-
-    show_idk = st.sidebar.checkbox("Only examples with IDK rollouts", value=False)
-    show_false_positives = st.sidebar.checkbox(
-        "Judge says correct — manual inspection needed", value=False
-    )
-
-    entity_filter = st.sidebar.selectbox("Entity", ["all"] + entities)
-    question_filter = st.sidebar.selectbox("Question template", ["all"] + questions)
-
-    # ── Apply filters ───────────────────────────────────────────────
-    IDK = IDK_VARIANTS
-
-    filtered = []
-    for r in rows:
+    def _keep(r) -> bool:
         v = r.get("judge_verdicts", [])
-        ci = sum(v)
-        if judge_hit_target is not None and any(v) != judge_hit_target:
-            continue
-        if ci < min_ci or ci > max_ci:
-            continue
-        if entity_filter != "all" and r.get("entity_text", "") != entity_filter:
-            continue
-        if question_filter != "all" and r.get("question", "") != question_filter:
-            continue
-        if show_idk:
-            texts = r.get("all_texts", [])
-            if not any(t.strip().lower() in IDK for t in texts):
-                continue
-        if show_false_positives:
-            if ci == 0 or ci > 5:
-                continue
-            if not any(v):
-                continue
+        hit = any(v)
+        if filter_hit == "hit" and not hit:
+            return False
+        if filter_hit == "miss" and hit:
+            return False
+        if support_filter != "all":
+            if not hit:
+                return False
+            cat = support_by_id.get(r["data_id"])
+            if support_filter == "supported" and not is_supported(cat):
+                return False
+            if support_filter == "under-specific (hypernym)" and cat != "answer_contains_prediction":
+                return False
+            if support_filter == "unsupported" and (
+                is_supported(cat) or cat == "answer_contains_prediction"
+            ):
+                return False
         if search:
-            texts = r.get("all_texts", [])
-            answer = r.get("answer", "")
-            if not any(search.lower() in t.lower() for t in texts) and search.lower() not in answer.lower():
-                continue
-        filtered.append(r)
+            s = search.lower()
+            if s not in r.get("answer", "").lower() and not any(
+                s in t.lower() for t in r.get("all_texts", [])
+            ):
+                return False
+        return True
 
+    filtered = [r for r in rows if _keep(r)]
     st.sidebar.write(f"Showing {len(filtered):,} / {len(rows):,}")
 
-    # ── Summary stats ───────────────────────────────────────────────
+    # ── Header + at-a-glance metrics ────────────────────────────────
     st.title("Judge Verdict Explorer")
-
     if not filtered:
-        st.warning("No examples match filters.")
+        st.warning("No examples match the current filters.")
         return
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Filtered examples", len(filtered))
-    with col2:
-        hit_rate = sum(1 for r in filtered if any(r.get("judge_verdicts", []))) / len(filtered)
-        st.metric("Judge hit rate", f"{hit_rate:.1%}")
-    with col3:
-        avg_ci = sum(sum(r.get("judge_verdicts", [])) for r in filtered) / len(filtered)
-        st.metric("Avg cᵢ", f"{avg_ci:.1f}")
+    m = st.columns(3)
+    m[0].metric("Filtered", f"{len(filtered):,}")
+    hit_rate = sum(1 for r in filtered if any(r.get("judge_verdicts", []))) / len(filtered)
+    m[1].metric("Judge hit rate", f"{hit_rate:.1%}")
+    avg_ci = sum(sum(r.get("judge_verdicts", [])) for r in filtered) / len(filtered)
+    m[2].metric("Avg cᵢ", f"{avg_ci:.1f}")
 
-    # ── Random sample button ────────────────────────────────────────
-    if st.button("🎲 Random example"):
-        r = random.choice(filtered)
-        st.session_state["selected"] = r["data_id"]
+    # ── One navigator: Prev / Random / Next over the filtered set ───
+    st.session_state.setdefault("cursor", 0)
+    nav = st.columns([1, 1, 1, 4])
+    if nav[0].button("◀ Prev", use_container_width=True):
+        st.session_state.cursor -= 1
+    if nav[1].button("🎲 Random", use_container_width=True):
+        st.session_state.cursor = random.randrange(len(filtered))
+    if nav[2].button("Next ▶", use_container_width=True):
+        st.session_state.cursor += 1
+    st.session_state.cursor = max(0, min(st.session_state.cursor, len(filtered) - 1))
+    nav[3].markdown(f"### Example {st.session_state.cursor + 1:,} of {len(filtered):,}")
 
-    # ── Search by ID ────────────────────────────────────────────────
-    search_id = st.text_input("Or search by data_id / image_id", "")
-    if search_id:
-        for r in filtered:
-            if search_id in r.get("data_id", "") or search_id in r.get("image_id", ""):
-                st.session_state["selected"] = r["data_id"]
-                break
-
-    # ── Example list ────────────────────────────────────────────────
-    st.subheader("Examples")
-    page_size = 20
-    page = st.number_input("Page", 0, len(filtered) // page_size, 0)
-    start = page * page_size
-    end = min(start + page_size, len(filtered))
-
-    for r in filtered[start:end]:
-        v = r.get("judge_verdicts", [])
-        ci = sum(v)
-        hit = any(v)
-        icon = "✅" if hit else "❌"
-
-        col1, col2, col3, col4 = st.columns([3, 1.5, 1.5, 1])
-        with col1:
-            st.write(f"{icon} `{r['data_id']}`")
-            q = r.get("question", "")
-            if len(q) > 80:
-                q = q[:77] + "..."
-            st.write(f"Q: *{q}*")
-        with col2:
-            st.write(f"GT: **{r.get('answer', '?')}**")
-        with col3:
-            st.write(f"cᵢ = {ci}/256")
-        with col4:
-            if st.button("🔍", key=f"btn_{r['data_id']}"):
-                st.session_state["selected"] = r["data_id"]
-
-    # ── Detail view ─────────────────────────────────────────────────
-    if "selected" not in st.session_state:
-        st.info("Click 🔍 on any example or try 🎲 random to inspect rollouts.")
-        return
-
-    selected = st.session_state["selected"]
-    selected_row = next((r for r in filtered if r["data_id"] == selected), None)
-    if selected_row is None:
-        st.error(f"Example {selected} not in filtered set.")
-        return
-
-    # ── Full detail ─────────────────────────────────────────────────
-    st.divider()
-    st.subheader(f"📋 {selected}")
-
-    r = selected_row
-
-    col_a, col_b = st.columns([2, 1])
-    with col_a:
-        st.write(f"**Question:** {r.get('question', '?')}")
-        st.write(f"**Ground Truth:** `{r.get('answer', '?')}`")
-        st.write(f"**Entity:** {r.get('entity_text', '?')} ({r.get('entity_id', '?')})")
-        st.write(f"**Original OVEN Q:** {r.get('oven_question', r.get('question', '?'))}")
-        # ── Prediction vs ground truth ──
-        st.divider()
-        pred = r.get("judge_selected_text", r.get("prediction", ""))
-        gt = r.get("answer", "")
-        st.write("**🔍 Prediction vs Ground Truth:**")
-
-        # Mechanical support check — same classifier the batch auditor uses.
-        support = classify_positive(
-            prediction=pred, answer=gt, aliases_by_canonical=aliases_by_canonical
-        )
-        if support is not None:
-            st.success(f"Prediction: `{pred}`  _(supported: {support})_")
-        else:
-            st.error(f"Prediction: `{pred}`  _(no mechanical support)_")
-        st.write(f"Ground truth: `{gt}`")
-    with col_b:
-        v = r.get("judge_verdicts", [])
-        ci = sum(v)
-        st.metric("cᵢ (correct)", ci)
-        st.metric("Judge hit", "✅ Yes" if any(v) else "❌ No")
-        texts = r.get("all_texts", [])
-        unique = len(set(texts))
-        st.metric("Unique answers", unique)
-        idk_count = sum(1 for t in texts if t.strip().lower() in IDK)
-        st.metric("IDK count", idk_count)
-        if any(v) and ci <= 5:
-            st.warning("⚠️ Low cᵢ — possible false positive")
-
-    # ── Answer distribution ─────────────────────────────────────────
-    st.subheader("Answer distribution (top 15)")
+    r = filtered[st.session_state.cursor]
+    v = r.get("judge_verdicts", [])
     texts = r.get("all_texts", [])
-    c = Counter(texts)
-    # Color-code: green for judged correct, red for wrong
-    verdicts = r.get("judge_verdicts", [])
+    ci = sum(v)
+    pred = _selected_pred(r)
+    gt = r.get("answer", "")
 
-    # Build a map: answer string → first judge verdict
-    answer_verdict = {}
-    for t, vd in zip(texts, verdicts):
-        if t not in answer_verdict:
-            answer_verdict[t] = vd
+    # ── Detail: question, GT, support verdict, key metrics ──────────
+    st.markdown(f"**Q:** {r.get('question', '?')}")
+    st.markdown(
+        f"**Ground truth:** `{gt}`  ·  "
+        f"**Entity:** {r.get('entity_text', '?')} (`{r.get('entity_id', '?')}`)"
+    )
 
-    top_answers = c.most_common(15)
-    for ans, count in top_answers:
-        correct = answer_verdict.get(ans, False)
-        symbol = "✅" if correct else "❌"
-        pct = count / len(texts) * 100
-        bar = "█" * int(pct)
-        st.write(f"{symbol} `{ans}` ({count}/{len(texts)} = {pct:.1f}%) {bar}")
+    support = classify_positive(
+        prediction=pred, answer=gt, aliases_by_canonical=aliases_by_canonical
+    )
+    if is_supported(support):
+        st.success(f"**Selected prediction:** `{pred}`  —  supported ({support})")
+    elif support == "answer_contains_prediction":
+        st.warning(
+            f"**Selected prediction:** `{pred}`  —  under-specific "
+            "(prediction ⊆ ground truth; a hypernym/parent, not counted as supported)"
+        )
+    else:
+        st.error(f"**Selected prediction:** `{pred}`  —  no mechanical support")
 
-    # ── Rollout browser ─────────────────────────────────────────────
-    st.subheader("Individual rollouts (first 100)")
-    show_correct_only = st.checkbox("Show only correct rollouts", value=False)
+    d = st.columns(3)
+    d[0].metric("cᵢ (correct / 256)", ci)
+    d[1].metric("Judge hit", "✅ Yes" if any(v) else "❌ No")
+    d[2].metric("Unique answers", len(set(texts)))
 
-    for i, (text, vd) in enumerate(zip(texts[:100], verdicts[:100])):
-        if show_correct_only and not vd:
-            continue
-        symbol = "✅" if vd else "❌"
-        display = text
-        if len(display) > 200:
-            display = display[:197] + "..."
-        st.write(f"{i+1:3d}. {symbol} {display}")
+    # ── Answer distribution: color-coded horizontal bars ────────────
+    st.subheader("Answer distribution")
+    if texts:
+        answer_verdict: dict[str, int] = {}
+        for t, vd in zip(texts, v):
+            answer_verdict.setdefault(t, vd)
+        top = Counter(texts).most_common(12)
+        df = pd.DataFrame(
+            [
+                {
+                    "answer": (a[:40] + "…") if len(a) > 40 else (a or "∅ (empty)"),
+                    "rollouts": n,
+                    "verdict": "correct" if answer_verdict.get(a) else "incorrect",
+                }
+                for a, n in top
+            ]
+        )
+        chart = (
+            alt.Chart(df)
+            .mark_bar()
+            .encode(
+                x=alt.X("rollouts:Q", title="rollouts (of 256)"),
+                y=alt.Y("answer:N", sort="-x", title=None),
+                color=alt.Color(
+                    "verdict:N",
+                    scale=alt.Scale(domain=["correct", "incorrect"],
+                                    range=["#2ecc71", "#e74c3c"]),
+                    legend=alt.Legend(title="judge verdict"),
+                ),
+                tooltip=["answer", "rollouts", "verdict"],
+            )
+            .properties(height=min(30 * len(df) + 30, 420))
+        )
+        st.altair_chart(chart, use_container_width=True)
 
-    # ── Show also judge_raw if available ────────────────────────────
+    # ── Optional drill-down, collapsed to keep the page clean ───────
+    with st.expander("Individual rollouts (first 100)"):
+        only_correct = st.checkbox("Only correct rollouts", value=False, key="only_correct")
+        shown = [
+            f"{i + 1:3d}. {'✅' if vd else '❌'} {t[:200]}"
+            for i, (t, vd) in enumerate(zip(texts[:100], v[:100]))
+            if not (only_correct and not vd)
+        ]
+        st.text("\n".join(shown) or "—")
+
     raw = r.get("judge_raw", [])
     if raw:
-        st.subheader("Judge raw outputs (first 10)")
-        for i, raw_text in enumerate(raw[:10]):
-            st.code(raw_text[:500], language="text")
+        with st.expander("Judge raw outputs (first 10)"):
+            for raw_text in raw[:10]:
+                st.code(raw_text[:500], language="text")
 
 
 if __name__ == "__main__":
