@@ -27,7 +27,7 @@ import re
 from collections import defaultdict
 from typing import Callable, Optional
 
-from oven_mllm_eval.scores import calc_hierarchical_metrics
+from oven_mllm_eval.scores import calc_hierarchical_metrics, normalize as _scores_normalize
 
 
 # ---------------------------------------------------------------------------
@@ -67,10 +67,13 @@ def _remove_stuff(text: str) -> str:
 
 
 def _normalise(text: str) -> str:
-    """Lower-case, replace dashes/underscores with spaces, strip punctuation."""
-    text = text.lower().replace("_", " ").replace("-", " ")
-    text = re.sub(r"[^a-z0-9 ]+", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
+    """Normalise for matching, mirroring the reference ``normalize()``.
+
+    Reuses ``scores.normalize`` (lower-case, dash→space, strip *ASCII*
+    punctuation) so Unicode letters are kept — "España"→"españa", not "espa a".
+    Whitespace is then collapsed for stable exact comparison.
+    """
+    return re.sub(r"\s+", " ", _scores_normalize(text)).strip()
 
 
 def _get_n_grams(text: str, n: int) -> set[str]:
@@ -184,20 +187,18 @@ class TaxonomyMatcher:
         top_idxs, top_scores : optional
             Precomputed top-k node indices and retrieval scores (e.g. from
             cosine similarity).  When provided, the lexical Step 1 is skipped
-            and these drive the cascade — this is the ``sentence_bert`` path.
+            and these drive the cascade — this is the ``cascade`` measure's path.
         """
         if not self.all_nodes:
             return None
-
-        # Embedding path = caller supplied cosine top-k.  It follows the CVPR
-        # reference cascade (exact-equality in top-k, no contains-over-all),
-        # whereas the lexical path keeps the original containment behaviour.
-        embedding_mode = top_idxs is not None
 
         cleaned = _remove_stuff(prediction)
         norm_pred = _normalise(cleaned)
 
         # --- Step 1: obtain top-k candidates + the all-node iteration order --
+        #   Lexical path scores all nodes here; embedding path is handed the
+        #   cosine top-k.  Everything after is the shared, reference-faithful
+        #   cascade (exact-equality → n-gram → voting → top-score).
         if top_idxs is None:
             #   Lexical: score all nodes, sort, take top-k.
             #   Equivalent: S = [(m(pred, v.label), v) for v in T]
@@ -210,52 +211,41 @@ class TaxonomyMatcher:
             top_scores = [scores[i] for i in top_idxs]
             all_order = ranked
         else:
-            #   Embedding: top-k already retrieved.  The all-node stages
-            #   (3, 4) select by depth, not score, so iteration order is
-            #   irrelevant — use the original node order.
+            #   Embedding: top-k already retrieved.  The all-node n-gram stage
+            #   selects by depth, not score, so iteration order is irrelevant —
+            #   use the original node order.
             all_order = range(len(self.all_nodes))
 
         top_nodes = [self.all_nodes[i] for i in top_idxs]
         s_k = _softmax(top_scores)
 
-        # Normalised labels for the contains / n-gram stages
+        # Normalised labels for the n-gram stages
         top_norm = [self._norm_labels[i] for i in top_idxs]
         all_norm_sorted = [self._norm_labels[i] for i in all_order]
         all_nodes_sorted = [self.all_nodes[i] for i in all_order]
 
-        # --- Step 2: match in top-k ---------------------------------------
-        #   Embedding path: exact equality (reference check_topks).
-        #   Lexical path: containment (original behaviour).
-        if embedding_mode:
-            cand = self._exact_in_topk(norm_pred, top_norm, top_nodes)
-        else:
-            cand = self._contains_check(norm_pred, top_norm, top_nodes)
+        # --- Step 2: exact-equality match in top-k (reference check_topks) --
+        cand = self._exact_in_topk(norm_pred, top_norm, top_nodes)
         if cand is not None:
             return self._make_result(cand, "exact_match_in_top_k")
 
-        # --- Step 3: contains check in all nodes (lexical path only) -------
-        #   The reference has no contains-over-all stage; on the embedding
-        #   path it would hijack cosine retrieval via spurious substrings
-        #   (e.g. "food" in "seafood"), so it is skipped there.
-        if not embedding_mode:
-            cand = self._contains_check(norm_pred, all_norm_sorted, all_nodes_sorted)
-            if cand is not None:
-                return self._make_result(cand, "exact_match")
-
-        # --- Step 4: n-gram overlap ----------------------------------------
-        #   For n in (4, 3, 2), try top-k first, then all nodes
-        for n in (4, 3, 2):
+        # --- Step 3: n-gram overlap, top-k then all nodes, N = 4..1 --------
+        #   Top-k: node n-grams ∩ pred n-grams (reference n_gram_variants=True).
+        #   All-nodes: a pred n-gram must equal a FULL node label (reference
+        #   n_gram_variants=False) — stricter, so a multi-word node can't be
+        #   hijacked by one shared word ("of the", or "a" from "España").
+        for n in (4, 3, 2, 1):
             pred_ngrams = _get_n_grams(norm_pred, n)
             if not pred_ngrams:
                 continue
 
-            # Top-k first
+            # Top-k first (partial n-gram overlap, only over the k candidates)
             cand = self._ngram_check(pred_ngrams, top_norm, top_nodes, n)
             if cand is not None:
                 return self._make_result(cand, f"ngram_topk_match_{n}")
 
-            # Then all nodes
-            cand = self._ngram_check(pred_ngrams, all_norm_sorted, all_nodes_sorted, n)
+            # Then all nodes (a pred n-gram must equal a whole label)
+            cand = self._fulllabel_ngram_check(pred_ngrams, all_norm_sorted, all_nodes_sorted)
             if cand is not None:
                 return self._make_result(cand, f"ngram_match_{n}")
 
@@ -263,13 +253,13 @@ class TaxonomyMatcher:
         if self.min_score is not None and (not top_scores or max(top_scores) < self.min_score):
             return {"predicted_node": None, "predicted_path": None, "mapping_method": "none"}
 
-        # --- Step 5: voting — if top-k scores are ambiguous ---------------
+        # --- Step 4: voting — if top-k scores are ambiguous ---------------
         if len(s_k) >= 2 and (s_k[0] - s_k[1] < self.thr_top2) and (s_k[0] - s_k[-1] < self.thr_topk):
             cand = self._voting_fallback(top_nodes)
             if cand is not None:
                 return self._make_result(cand, "voting")
 
-        # --- Step 6: top-score fallback -----------------------------------
+        # --- Step 5: top-score fallback -----------------------------------
         return self._make_result(top_nodes[0], "top_score")
 
     def evaluate(
@@ -372,21 +362,17 @@ class TaxonomyMatcher:
                     best_node = original
         return best_node
 
-    def _contains_check(self, norm_pred: str, norm_labels: list[str], original_labels: list[str]) -> str | None:
-        """Return the most specific node whose normalised label is a substring of norm_pred.
+    def _fulllabel_ngram_check(self, pred_ngrams: set[str], norm_labels: list[str], original_labels: list[str]) -> str | None:
+        """Most specific node whose full label equals one of the prediction's n-grams.
 
-        Most specific = deepest in taxonomy = longest path.
-        networkx equivalent: len(anc(v)) → len(node_to_path[v]).
+        Reference n_gram_variants=False (all-nodes stage): a prediction n-gram
+        must match a whole node label, so a multi-word node cannot be hijacked
+        by a single shared word.
         """
         best_node = None
         best_depth = -1
         for norm_label, original in zip(norm_labels, original_labels):
-            # Skip degenerate labels: an empty normalised label (e.g. an
-            # all-non-ASCII node stripped by _normalise) is a substring of
-            # every prediction, and a 1-char label matches spuriously.
-            if len(norm_label) < 2:
-                continue
-            if norm_label in norm_pred:
+            if norm_label and norm_label in pred_ngrams:
                 depth = len(self.node_to_path.get(original, []))
                 if depth > best_depth:
                     best_depth = depth
