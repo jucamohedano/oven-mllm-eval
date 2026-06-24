@@ -105,9 +105,12 @@ INF_DESC_CHAINS="data/raw/oven_wikidata_chains_cleaned_descs.jsonl"
 # Scoring
 SCORING_INPUT=""
 SCORING_OUTPUT=""
+SCORING_SUMMARY=""        # aggregate results JSON (empty = auto-derive)
 SCORING_TAXONOMY_INDEX="data/processed/oven_taxonomy_index.json"
 SCORING_MEASURE="exact_match"
 SCORING_NUM_WORKERS="0"
+SCORING_MAX_EXAMPLES=""   # cap for quick tests (empty = all)
+SCORING_GPUS="0"          # GPUs for a score-only job (needed for the 'cascade' measure)
 
 # ---------------------------------------------------------------------------
 # Parse arguments
@@ -128,9 +131,12 @@ main() {
             -n|--name)         SLURM_NAME="$2"; shift 2 ;;
             --input)           SCORING_INPUT="$2"; shift 2 ;;
             --output)          SCORING_OUTPUT="$2"; shift 2 ;;
+            --summary)         SCORING_SUMMARY="$2"; shift 2 ;;
             --taxonomy-index)  SCORING_TAXONOMY_INDEX="$2"; shift 2 ;;
             --measure)         SCORING_MEASURE="$2"; shift 2 ;;
             --num-workers)     SCORING_NUM_WORKERS="$2"; shift 2 ;;
+            --max-examples)    SCORING_MAX_EXAMPLES="$2"; shift 2 ;;
+            --gpus)            SCORING_GPUS="$2"; shift 2 ;;
             --judge-model)     INF_JUDGE_MODEL="$2"; shift 2 ;;
             --judge-gpus)      INF_JUDGE_GPUS="$2"; shift 2 ;;
             --judge-max-model-len) INF_JUDGE_MAX_MODEL_LEN="$2"; shift 2 ;;
@@ -247,9 +253,18 @@ main() {
     echo ""
 
     GPU_DIRECTIVE=""
+    _N_GPUS=0
     if [[ -n "$INF_JUDGE_MODEL" ]]; then
-        GPU_DIRECTIVE="#SBATCH --gres=gpu:$INF_JUDGE_GPUS"
+        _N_GPUS="$INF_JUDGE_GPUS"
+    elif [[ "$SCORING_GPUS" -gt 0 ]]; then
+        _N_GPUS="$SCORING_GPUS"   # score-only GPU (cascade measure needs it)
     fi
+    if [[ "$_N_GPUS" -gt 0 ]]; then
+        GPU_DIRECTIVE="#SBATCH --gres=gpu:$_N_GPUS"
+    fi
+    # cascade embedding device: cuda iff a GPU is allocated, else cpu (fine for a --max-examples test)
+    _EMBED_DEVICE="cpu"
+    [[ "$_N_GPUS" -gt 0 ]] && _EMBED_DEVICE="cuda"
 
     sbatch <<EOT
 #!/bin/bash
@@ -274,6 +289,8 @@ module load nvhpc/24.5 gcc/12.2.0
 export CC=gcc CXX=g++ OMP_NUM_THREADS=1
 if [[ -f ".env" ]]; then set -a; source .env; set +a; fi
 source .venv/bin/activate
+# Node-embedding cache location (point at \$WORK to keep it off the full FAST scratch).
+export OVEN_NODE_EMB_DIR="${OVEN_NODE_EMB_DIR:-/leonardo_work/EUHPC_D33_243/oven_node_emb}"
 
 echo "[info] \$SLURM_JOB_ID on \$(hostname)"
 echo "  Input:    $SCORING_INPUT"
@@ -356,7 +373,8 @@ python -m scripts.score_predictions \\
     --output "$SCORING_OUTPUT" \\
     --taxonomy-index "$SCORING_TAXONOMY_INDEX" \\
     --measure $SCORING_MEASURE \\
-    --num-workers $SCORING_NUM_WORKERS
+    --num-workers $SCORING_NUM_WORKERS \\
+    --embed-device $_EMBED_DEVICE${SCORING_SUMMARY:+ --summary $SCORING_SUMMARY}${SCORING_MAX_EXAMPLES:+ --max-examples $SCORING_MAX_EXAMPLES}
 
 # Clean up intermediate shard files only if a judge was used, scoring
 # succeeded, and row counts match between shards and merged files.
