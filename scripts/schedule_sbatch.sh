@@ -78,6 +78,8 @@ vLLM engine options:
     --max-num-seqs <N>            Max concurrent sequences — lower reduces KV cache memory (default: 1024)
     --max-pixels <N>              Max pixels for image resizing (default: 262144 = 512x512)
     --min-pixels <N>              Min pixels for image resizing (default: 65536 = 256x256)
+    --image-workers <N>           Threads for per-chunk image decoding (default: 16)
+    --prefetch-images             Decode the next image chunk while vLLM runs the current chunk
     --chunk-size <N>              Examples per llm.chat() call (default: 256)
     --max-restarts <N>            Max process-level restarts after a crash; each restart
                                   relaunches run_inference.py with --resume so completed
@@ -168,6 +170,8 @@ INF_MAX_MODEL_LEN="4096"
 INF_MAX_NUM_SEQS="1024"
 INF_MAX_PIXELS="262144"
 INF_MIN_PIXELS="65536"
+INF_IMAGE_WORKERS="16"
+INF_PREFETCH_IMAGES=false
 INF_CHUNK_SIZE="256"
 INF_ENFORCE_EAGER=false
 INF_BASE_MODEL=false
@@ -218,6 +222,8 @@ main() {
             --max-num-seqs)    INF_MAX_NUM_SEQS="$2"; shift 2 ;;
             --max-pixels)      INF_MAX_PIXELS="$2"; shift 2 ;;
             --min-pixels)      INF_MIN_PIXELS="$2"; shift 2 ;;
+            --image-workers)   INF_IMAGE_WORKERS="$2"; shift 2 ;;
+            --prefetch-images) INF_PREFETCH_IMAGES=true; shift ;;
             --chunk-size)      INF_CHUNK_SIZE="$2"; shift 2 ;;
             --enforce-eager)   INF_ENFORCE_EAGER=true; shift ;;
             --base-model)      INF_BASE_MODEL=true; shift ;;
@@ -302,6 +308,12 @@ main() {
         NO_IMAGE_FLAG="--no-image"
     fi
 
+    # Build image prefetch flag
+    PREFETCH_IMAGES_FLAG=""
+    if [[ "$INF_PREFETCH_IMAGES" == true ]]; then
+        PREFETCH_IMAGES_FLAG="--prefetch-images"
+    fi
+
     # Build judge description-evidence flags
     JUDGE_DESC_ARGS=""
     if [[ "$INF_JUDGE_WITH_DESC" == true ]]; then
@@ -339,6 +351,7 @@ main() {
     echo "  Top-k:        $INF_TOP_K"
     echo "  GPUs:         $SLURM_GPUS  (TP=$INF_TP, DP=$INF_DP)"
     echo "  Max pixels:   $INF_MAX_PIXELS"
+    echo "  Image workers:$INF_IMAGE_WORKERS  (prefetch=$INF_PREFETCH_IMAGES)"
     echo "  No image:     $INF_NO_IMAGE"
     echo "  Base model:   $INF_BASE_MODEL"
     echo "  Judge model:  ${INF_JUDGE_MODEL:-none}  (GPUs=$INF_JUDGE_GPUS, mode=$INF_JUDGE_MODE, n=$INF_JUDGE_N, temp=$INF_JUDGE_TEMPERATURE, top_p=$INF_JUDGE_TOP_P, top_k=$INF_JUDGE_TOP_K)"
@@ -449,11 +462,13 @@ if [[ "$INF_DP" -gt 1 ]]; then
                 --max-num-seqs "$INF_MAX_NUM_SEQS" \\
                 --max-pixels "$INF_MAX_PIXELS" \\
                 --min-pixels "$INF_MIN_PIXELS" \\
+                --image-workers "$INF_IMAGE_WORKERS" \\
                 --chunk-size "$INF_CHUNK_SIZE" \\
                 $ENFORCE_EAGER_FLAG \\
                 $BASE_MODEL_FLAG \\
                 $IMAGE_ROOT_FLAG \\
                 $NO_IMAGE_FLAG \\
+                $PREFETCH_IMAGES_FLAG \\
                 $METHOD_FLAGS \\
                 $MAX_EXAMPLES_FLAG \\
                 --resume \\
@@ -517,11 +532,13 @@ else
             --max-num-seqs "$INF_MAX_NUM_SEQS" \\
             --max-pixels "$INF_MAX_PIXELS" \\
             --min-pixels "$INF_MIN_PIXELS" \\
+            --image-workers "$INF_IMAGE_WORKERS" \\
             --chunk-size "$INF_CHUNK_SIZE" \\
             $ENFORCE_EAGER_FLAG \\
             $BASE_MODEL_FLAG \\
             $IMAGE_ROOT_FLAG \\
             $NO_IMAGE_FLAG \\
+            $PREFETCH_IMAGES_FLAG \\
             $METHOD_FLAGS \\
             $MAX_EXAMPLES_FLAG \\
             --resume \\
@@ -824,11 +841,13 @@ if [[ "$INF_DP" -gt 1 ]]; then
                 --max-num-seqs "$INF_MAX_NUM_SEQS" \\
                 --max-pixels "$INF_MAX_PIXELS" \\
                 --min-pixels "$INF_MIN_PIXELS" \\
+                --image-workers "$INF_IMAGE_WORKERS" \\
                 --chunk-size "$INF_CHUNK_SIZE" \\
                 $ENFORCE_EAGER_FLAG \\
                 $BASE_MODEL_FLAG \\
                 $IMAGE_ROOT_FLAG \\
                 $NO_IMAGE_FLAG \\
+                $PREFETCH_IMAGES_FLAG \\
                 \$([ "$INF_METHOD" = "naive-sampling" ] && echo "--samples-per-example $INF_SAMPLES_PER_EXAMPLE") \\
                 \$([ "$INF_METHOD" = "iterative" ] && echo "--attempts-per-round $INF_ATTEMPTS_PER_ROUND --max-rounds $INF_MAX_ROUNDS --enable-feedback $INF_FEEDBACK --max-feedback-chars $INF_MAX_FEEDBACK_CHARS") \\
                 $MAX_EXAMPLES_FLAG \\
@@ -917,11 +936,13 @@ else
             --max-num-seqs "$INF_MAX_NUM_SEQS" \\
             --max-pixels "$INF_MAX_PIXELS" \\
             --min-pixels "$INF_MIN_PIXELS" \\
+            --image-workers "$INF_IMAGE_WORKERS" \\
             --chunk-size "$INF_CHUNK_SIZE" \\
             $ENFORCE_EAGER_FLAG \\
             $BASE_MODEL_FLAG \\
             $IMAGE_ROOT_FLAG \\
             $NO_IMAGE_FLAG \\
+            $PREFETCH_IMAGES_FLAG \\
             \$([ "$INF_METHOD" = "naive-sampling" ] && echo "--samples-per-example $INF_SAMPLES_PER_EXAMPLE") \\
             \$([ "$INF_METHOD" = "iterative" ] && echo "--attempts-per-round $INF_ATTEMPTS_PER_ROUND --max-rounds $INF_MAX_ROUNDS --enable-feedback $INF_FEEDBACK --max-feedback-chars $INF_MAX_FEEDBACK_CHARS") \\
             $MAX_EXAMPLES_FLAG \\
