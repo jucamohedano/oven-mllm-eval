@@ -33,23 +33,31 @@ def _format_taxonomy_evidence(
     label_chain: list[str] | None,
     desc_chain: list[str] | None,
 ) -> str:
-    """Format available GT/parent/grandparent descriptions for judge prompts."""
-    if not desc_chain:
-        return ""
+    """Format GT/parent/grandparent taxonomy evidence for judge prompts.
 
+    The class *name* (label) for each level is shown whenever available — this
+    gives the judge the taxonomy boundaries (the broader parent/grandparent
+    classes that must NOT be accepted as a match for the more specific leaf),
+    which helps reject under-specific false positives. The Wikidata description
+    is appended when present, but a missing description no longer hides the
+    level's name. Gated on the label chain *or* the description chain existing.
+    """
     label_chain = label_chain or []
     desc_chain = desc_chain or []
-    lines = ["Ground-truth description evidence:"]
+    if not label_chain and not desc_chain:
+        return ""
+
+    lines = ["Ground-truth taxonomy evidence (leaf → broader ancestors):"]
     roles = ("Ground truth", "Parent", "Grandparent")
     for index, role in enumerate(roles):
-        if len(desc_chain) <= index:
-            continue
-        desc = str(desc_chain[index]).strip()
-        if not desc:
-            continue
         label = str(label_chain[index]).strip() if len(label_chain) > index else ""
-        if label:
+        desc = str(desc_chain[index]).strip() if len(desc_chain) > index else ""
+        if not label and not desc:
+            continue
+        if label and desc:
             lines.append(f"- {role}: {label} — {desc}")
+        elif label:
+            lines.append(f"- {role}: {label}")
         else:
             lines.append(f"- {role}: {desc}")
 
@@ -177,14 +185,17 @@ def build_judge_prompt_free_form_with_desc(
     return (
         "Your task is to judge whether the given response to a question "
         "matches a given ground truth answer or not. You are provided with "
-        "a question, a ground truth answer, supporting description evidence for "
-        "the ground truth answer, and the response you need to judge.\n\n"
+        "a question, a ground truth answer, supporting taxonomy evidence for "
+        "the ground-truth answer (its class and its broader parent/grandparent "
+        "classes, with descriptions where available), and the response you need "
+        "to judge.\n\n"
         "The response matches the ground truth if both are semantically "
         "equivalent — they refer to the same entity at the level of "
         "specificity asked by the question.\n\n"
-        "Use the description evidence only to disambiguate the ground-truth "
-        "answer. Do not mark a response correct merely because it matches "
-        "only the parent or grandparent class.\n\n"
+        "Use this evidence only to disambiguate the ground-truth answer. The "
+        "parent and grandparent classes are strictly broader than the ground "
+        "truth: do not mark a response correct merely because it matches only "
+        "a parent or grandparent class.\n\n"
         "Possible judgments:\n\n"
         '"0": The response does not match the ground-truth answer.\n'
         '"1": The response matches the ground-truth.\n\n'
