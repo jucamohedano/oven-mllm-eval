@@ -54,6 +54,10 @@ Sampling options:
 
 vLLM engine options:
     --tp <N>                      Tensor parallelism (default: 1)
+    --dp <N>                      Data-parallel replicas (default: 1). Each replica is an
+                                  independent process on its own GPU(s) handling a strided
+                                  shard; outputs are merged. Prefer this over --tp for models
+                                  that fit on one GPU. Requires --gpus >= dp*tp.
     --gpu-util <UTIL>             GPU memory utilization (default: 0.92)
     --max-model-len <LEN>         Max model context length (default: 2048)
     --max-num-seqs <N>            Max concurrent sequences (default: 1024)
@@ -103,6 +107,7 @@ RSA_TOP_K="-1"
 RSA_MAX_TOKENS="16"
 
 RSA_TP="1"
+RSA_DP="1"
 RSA_GPU_UTIL="0.92"
 RSA_MAX_MODEL_LEN="2048"
 RSA_MAX_NUM_SEQS="1024"
@@ -149,6 +154,7 @@ main() {
             --max-tokens)         RSA_MAX_TOKENS="$2"; shift 2 ;;
 
             --tp)                 RSA_TP="$2"; shift 2 ;;
+            --dp)                 RSA_DP="$2"; shift 2 ;;
             --gpu-util)           RSA_GPU_UTIL="$2"; shift 2 ;;
             --max-model-len)      RSA_MAX_MODEL_LEN="$2"; shift 2 ;;
             --max-num-seqs)       RSA_MAX_NUM_SEQS="$2"; shift 2 ;;
@@ -173,8 +179,8 @@ main() {
         echo "[error] --mem '$SLURM_MEM' has no unit suffix. Did you mean '${SLURM_MEM}G'?" >&2
         exit 1
     fi
-    if [[ "$RSA_TP" -gt "$SLURM_GPUS" ]]; then
-        echo "[error] --tp ($RSA_TP) cannot exceed --gpus ($SLURM_GPUS)" >&2
+    if [[ $(( RSA_DP * RSA_TP )) -gt "$SLURM_GPUS" ]]; then
+        echo "[error] --dp ($RSA_DP) × --tp ($RSA_TP) = $(( RSA_DP * RSA_TP )) cannot exceed --gpus ($SLURM_GPUS)" >&2
         exit 1
     fi
     if [[ "$RSA_RESUME" == "1" && "$RSA_OVERWRITE" == "1" ]]; then
@@ -197,7 +203,7 @@ main() {
     echo "  Max examples: ${RSA_MAX_EXAMPLES:-all}"
     echo "  Image root:   ${RSA_IMAGE_ROOT:-<cwd>}"
     echo "  Partition:    $SLURM_PARTITION"
-    echo "  GPUs:         $SLURM_GPUS (TP=$RSA_TP)"
+    echo "  GPUs:         $SLURM_GPUS (DP=$RSA_DP, TP=$RSA_TP)"
     echo "  CPUs:         $SLURM_CPUS"
     echo "  Mem:          $SLURM_MEM"
     echo "  Time:         $SLURM_TIME"
@@ -237,8 +243,8 @@ RSA_OUTPUT="$RSA_OUTPUT"
 RSA_MAX_EXAMPLES="$RSA_MAX_EXAMPLES"
 RSA_IMAGE_ROOT="$RSA_IMAGE_ROOT"
 
-RSA_CMD=(
-    python scripts/run_recursive_self_agg.py
+# Common python args shared by every replica (output/tp/shard/resume added below).
+RSA_ARGS=(
     --input "$RSA_INPUT"
     --model "$RSA_MODEL"
     --prompt-variant "$RSA_PROMPT_VARIANT"
@@ -251,7 +257,6 @@ RSA_CMD=(
     --top-p "$RSA_TOP_P"
     --top-k "$RSA_TOP_K"
     --max-tokens "$RSA_MAX_TOKENS"
-    --tp "$RSA_TP"
     --gpu-util "$RSA_GPU_UTIL"
     --max-model-len "$RSA_MAX_MODEL_LEN"
     --max-num-seqs "$RSA_MAX_NUM_SEQS"
@@ -260,15 +265,79 @@ RSA_CMD=(
     --chunk-size "$RSA_CHUNK_SIZE"
     --restart-every "$RSA_RESTART_EVERY"
 )
-if [[ -n "\$RSA_OUTPUT" ]]; then RSA_CMD+=(--output "\$RSA_OUTPUT"); fi
-if [[ -n "\$RSA_MAX_EXAMPLES" ]]; then RSA_CMD+=(--max-examples "\$RSA_MAX_EXAMPLES"); fi
-if [[ -n "\$RSA_IMAGE_ROOT" ]]; then RSA_CMD+=(--image-root "\$RSA_IMAGE_ROOT"); fi
-if [[ "$RSA_NO_IMAGE" == "1" ]]; then RSA_CMD+=(--no-image); fi
-if [[ "$RSA_RESUME" == "1" ]]; then RSA_CMD+=(--resume); fi
-if [[ "$RSA_OVERWRITE" == "1" ]]; then RSA_CMD+=(--overwrite); fi
-if [[ "$RSA_ENFORCE_EAGER" == "1" ]]; then RSA_CMD+=(--enforce-eager); fi
+if [[ -n "\$RSA_MAX_EXAMPLES" ]]; then RSA_ARGS+=(--max-examples "\$RSA_MAX_EXAMPLES"); fi
+if [[ -n "\$RSA_IMAGE_ROOT" ]]; then RSA_ARGS+=(--image-root "\$RSA_IMAGE_ROOT"); fi
+if [[ "$RSA_NO_IMAGE" == "1" ]]; then RSA_ARGS+=(--no-image); fi
+if [[ "$RSA_ENFORCE_EAGER" == "1" ]]; then RSA_ARGS+=(--enforce-eager); fi
 
-"\${RSA_CMD[@]}"
+# Canonical (merged) output path — must match run_recursive_self_agg's default.
+if [[ -n "\$RSA_OUTPUT" ]]; then
+    BASE_OUT="\$RSA_OUTPUT"
+else
+    BASE_OUT="\$(dirname "$RSA_INPUT")/\$(basename "$RSA_INPUT" .jsonl)_rsa_n${RSA_POPULATION}_k${RSA_K}_t${RSA_STEPS}.jsonl"
+fi
+
+if [[ $RSA_DP -le 1 ]]; then
+    # ── Single replica ───────────────────────────────────────────────
+    SINGLE=(python scripts/run_recursive_self_agg.py "\${RSA_ARGS[@]}" --tp $RSA_TP --output "\$BASE_OUT")
+    if [[ "$RSA_RESUME" == "1" ]]; then SINGLE+=(--resume); fi
+    if [[ "$RSA_OVERWRITE" == "1" ]]; then SINGLE+=(--overwrite); fi
+    "\${SINGLE[@]}"
+else
+    # ── Data-parallel: one process per shard, strided, then merge ─────
+    IFS=',' read -ra ALLOC_GPUS <<< "\${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+    need=\$(( $RSA_DP * $RSA_TP ))
+    if [[ \${need} -gt \${#ALLOC_GPUS[@]} ]]; then
+        echo "[error] dp×tp=\${need} GPUs, only \${#ALLOC_GPUS[@]} allocated" >&2; exit 1
+    fi
+    if [[ "$RSA_OVERWRITE" == "1" ]]; then
+        rm -f "\${BASE_OUT%.jsonl}_shard"*.jsonl "\$BASE_OUT"
+    fi
+
+    run_shard() {
+        local i="\$1" devs="\$2" attempt=0 rc=0
+        while true; do
+            rc=0
+            CUDA_VISIBLE_DEVICES="\$devs" python -u scripts/run_recursive_self_agg.py \\
+                "\${RSA_ARGS[@]}" --tp $RSA_TP --output "\$BASE_OUT" \\
+                --shard "\$i" --num-shards $RSA_DP --resume \\
+                2>&1 | stdbuf -oL sed "s/^/[shard \$i] /" || rc=\${PIPESTATUS[0]}
+            [ "\$rc" -eq 0 ] && return 0
+            attempt=\$((attempt + 1))
+            if [ "\$attempt" -ge 10 ]; then
+                echo "[shard \$i] giving up after \$attempt restarts (rc=\$rc)" >&2; return "\$rc"
+            fi
+            echo "[shard \$i] crashed (rc=\$rc) — relaunching with --resume (\$attempt/10)" >&2
+            sleep 20
+        done
+    }
+
+    pids=()
+    for i in \$(seq 0 \$(($RSA_DP - 1))); do
+        devs=\$(IFS=,; echo "\${ALLOC_GPUS[*]:\$((i * $RSA_TP)):$RSA_TP}")
+        echo "[info] launching RSA shard \$i on GPU(s) \${devs}"
+        run_shard "\$i" "\${devs}" &
+        pids+=(\$!)
+    done
+    fail=0
+    for pid in "\${pids[@]}"; do wait "\$pid" || fail=1; done
+    if [[ \$fail -ne 0 ]]; then echo "[error] an RSA shard failed" >&2; exit 1; fi
+
+    # Merge: fold any pre-existing merged file (e.g. from a prior single-GPU
+    # dp=1 run that wrote directly to BASE_OUT) together with all shard files,
+    # then de-duplicate by data_id so no earlier progress is lost. The shard
+    # files remain as the durable source; BASE_OUT is the canonical merged copy.
+    merge_inputs=()
+    [[ -s "\$BASE_OUT" ]] && merge_inputs+=("\$BASE_OUT")
+    while IFS= read -r _s; do merge_inputs+=("\$_s"); done \
+        < <(ls "\${BASE_OUT%.jsonl}_shard"*.jsonl 2>/dev/null | sort)
+    if [[ \${#merge_inputs[@]} -gt 0 ]]; then
+        cat "\${merge_inputs[@]}" > "\${BASE_OUT}.merge.tmp"
+        python scripts/dedup_samples.py "\${BASE_OUT}.merge.tmp" --drop-malformed >/dev/null || true
+        mv "\${BASE_OUT}.merge.tmp" "\$BASE_OUT"
+        echo "[merge] → \$(wc -l < "\$BASE_OUT") rows in \$BASE_OUT"
+    fi
+fi
 
 echo "[info] Done."
 EOT

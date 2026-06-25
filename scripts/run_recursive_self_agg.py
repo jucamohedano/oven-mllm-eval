@@ -43,7 +43,8 @@ DOWNSTREAM_PREFIXES = (
     "judge_",
     "exact_match_",
     "contained_",
-    "sentence_bert_",
+    "cascade_",          # current taxonomy-mapping scored fields
+    "sentence_bert_",    # legacy name (kept so old scored files still strip clean)
     "scored_",
 )
 DOWNSTREAM_KEYS = {
@@ -133,6 +134,20 @@ def _done_ids(path: Path) -> set[str]:
     return done
 
 
+def _global_done_ids(base_output: Path) -> set[str]:
+    """Union of done IDs across the merged file and every ``_shard*`` file.
+
+    Reading all shard files gives a global resume set, so a data-parallel run
+    resumes correctly even if the shard count changed between attempts (mirrors
+    ``scripts/run_inference.py``).
+    """
+    done: set[str] = set()
+    candidates = [base_output, *sorted(base_output.parent.glob(f"{base_output.stem}_shard*.jsonl"))]
+    for path in candidates:
+        done |= _done_ids(path)
+    return done
+
+
 def _resolve_image_path(path: str, root: Path) -> str:
     """Resolve image paths like ``scripts/run_inference.py`` does."""
     if not path:
@@ -212,14 +227,14 @@ def build_oven_rsa_prompt(
 
     if len(candidate_answers) == 1:
         parts.append(
-            "You are given an image question and one candidate answer. "
+            "You are given an image, a question about the image, and one candidate answer. "
             "The candidate may be incomplete or wrong. Use the image and the question "
             "to produce one improved answer. If the candidate is wrong, answer with a better label. "
             "Return only the final answer; do not explain.\n"
         )
     else:
         parts.append(
-            "You are given an image question and several candidate answers. "
+            "You are given an image, a question about the image, and several candidate answers. "
             "Some candidates may be incorrect or under-specific. Aggregate the useful clues, "
             "choose the answer best supported by the image and question, and produce one improved answer. "
             "If all candidates seem wrong, answer with a better label. "
@@ -309,6 +324,8 @@ def _write_metadata(
             "max_examples": args.max_examples,
             "chunk_size": args.chunk_size,
             "no_image": args.no_image,
+            "shard": args.shard,
+            "num_shards": args.num_shards,
         },
     }
     metadata_path = output_path.with_suffix("").with_name(f"{output_path.stem}_metadata.json")
@@ -413,6 +430,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=1234,
                         help="Seed for candidate subset sampling")
 
+    # External data-parallel sharding: one process per GPU, each takes a stride.
+    parser.add_argument("--shard", type=int, default=0,
+                        help="This process's shard index (0-based) for data-parallel runs")
+    parser.add_argument("--num-shards", type=int, default=1,
+                        help="Total shards. Each process handles examples[shard::num_shards]")
+
     parser.add_argument("--image-root", default=None,
                         help="Root for resolving relative image_path (default: cwd)")
     parser.add_argument("--no-image", action="store_true",
@@ -462,7 +485,13 @@ def main() -> None:
     if not args.input.exists():
         raise SystemExit(f"--input not found: {args.input}")
 
-    output_path = args.output or _default_output_path(args.input, args.population, args.k, args.steps)
+    base_output = args.output or _default_output_path(args.input, args.population, args.k, args.steps)
+    if args.num_shards > 1:
+        if not (0 <= args.shard < args.num_shards):
+            raise SystemExit(f"--shard must be in [0, {args.num_shards}), got {args.shard}")
+        output_path = base_output.with_name(f"{base_output.stem}_shard{args.shard}.jsonl")
+    else:
+        output_path = base_output
     output_path.parent.mkdir(parents=True, exist_ok=True)
     metadata_path = output_path.with_suffix("").with_name(f"{output_path.stem}_metadata.json")
     if args.overwrite and not args.resume:
@@ -476,15 +505,20 @@ def main() -> None:
     if not rows:
         raise SystemExit("No input rows found")
 
+    # Strided sharding — balances load even if the file is ordered by category.
+    if args.num_shards > 1:
+        rows = rows[args.shard::args.num_shards]
+        print(f"Shard {args.shard}/{args.num_shards}: {len(rows)} examples")
+
     missing_all_texts = sum(1 for row in rows if not row.get("all_texts"))
     if missing_all_texts:
         raise SystemExit(f"{missing_all_texts} rows have no all_texts; RSA requires naive-sampling outputs")
 
     if args.resume:
         _clean_output_jsonl(output_path)
-        done = _done_ids(output_path)
+        done = _global_done_ids(base_output)
         rows = [row for row in rows if _row_id(row) not in done]
-        print(f"Resuming: {len(done)} already done, {len(rows)} remaining")
+        print(f"Resuming: {len(done)} already done globally, {len(rows)} remaining in this shard")
     else:
         done = set()
 
@@ -550,7 +584,7 @@ def main() -> None:
     sampling_params = SamplingParams(**sampling_kwargs)
 
     n_chunks = (len(rows) + args.chunk_size - 1) // args.chunk_size
-    show_tqdm = True
+    show_tqdm = args.num_shards <= 1  # \r redraws collide when shards share stdout
     processed = 0
 
     for chunk_idx in range(n_chunks):
