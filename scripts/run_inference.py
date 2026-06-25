@@ -50,7 +50,7 @@ from vllm import LLM, SamplingParams
 # Ensure project is importable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from oven_mllm_eval.io import append_jsonl
+from oven_mllm_eval.io import append_jsonl, write_jsonl
 from oven_mllm_eval.prompts import get_prompt, PROMPT_VARIANTS
 
 
@@ -155,7 +155,7 @@ def _resolve_image_path(path: str, root: Path) -> str:
     return str(p)
 
 
-def _load_images(paths: list[str]) -> list[Image.Image]:
+def _load_images(paths: list[str], max_workers: int = 16) -> list[Image.Image]:
     """Decode a batch of images in parallel.
 
     Called per chunk (NOT upfront for the whole dataset): PIL pixel buffers
@@ -164,7 +164,7 @@ def _load_images(paths: list[str]) -> list[Image.Image]:
     engine core process.  Loading per chunk keeps the working set to one
     chunk and lets the GC reclaim it after each llm.chat() call.
     """
-    with ThreadPoolExecutor(max_workers=16) as pool:
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
         return list(pool.map(_load_pil, paths))
 
 
@@ -381,6 +381,11 @@ def main():
                         help="Max pixels for image resizing (default: 262144 = 512x512)")
     parser.add_argument("--min-pixels", type=int, default=256 * 256,
                         help="Min pixels for image resizing (default: 65536 = 256x256)")
+    parser.add_argument("--image-workers", type=int, default=16,
+                        help="Threads used for per-chunk PIL image decoding (default: 16)")
+    parser.add_argument("--prefetch-images", action="store_true",
+                        help="Decode the next image chunk while the current chunk is in vLLM. "
+                             "Improves GPU utilization at the cost of one extra chunk of host RAM.")
     parser.add_argument("--enforce-eager", action="store_true",
                         help="Disable CUDA graphs — slower but more uniform step latency")
     parser.add_argument("--async-scheduling", action="store_true",
@@ -411,6 +416,8 @@ def main():
     # Validate sampling params
     if args.temperature <= 0:
         parser.error(f"--temperature must be > 0, got {args.temperature}")
+    if args.image_workers <= 0:
+        parser.error(f"--image-workers must be > 0, got {args.image_workers}")
 
     # Determine n from method
     n = args.n
@@ -621,6 +628,8 @@ def main():
             "max_num_seqs": args.max_num_seqs,
             "max_pixels": args.max_pixels,
             "min_pixels": args.min_pixels,
+            "image_workers": args.image_workers,
+            "prefetch_images": args.prefetch_images,
             "enforce_eager": args.enforce_eager,
             "async_scheduling": args.async_scheduling,
         },
@@ -669,7 +678,10 @@ def main():
             s = ci * args.chunk_size
             e = min(s + args.chunk_size, len(examples))
             print(f"[chunk {ci + 1}/{n_chunks}] examples {s}–{e - 1}")
-            chunk_images = [None] * (e - s) if args.no_image else _load_images(resolved_paths[s:e])
+            chunk_images = [None] * (e - s) if args.no_image else _load_images(
+                resolved_paths[s:e],
+                args.image_workers,
+            )
             run_iterative(
                 llm, examples[s:e], chunk_images, args.prompt_variant,
                 sampling_kwargs, args.max_tokens,
@@ -682,69 +694,123 @@ def main():
     else:
         sampling_params = SamplingParams(**sampling_kwargs, max_tokens=args.max_tokens)
         n_chunks = (len(examples) + args.chunk_size - 1) // args.chunk_size
+        prefetch_enabled = args.prefetch_images and not args.no_image
+        prefetch_pool: ThreadPoolExecutor | None = None
+        next_images_future = None
 
-        for ci in range(n_chunks):
-            # Periodic engine restart to work around vLLM 0.11.2 memory leak
-            if args.restart_every and ci > 0 and ci % args.restart_every == 0:
-                print(f"[restart] reinitializing engine after {args.restart_every} chunks", flush=True)
-                llm = _restart_engine(llm)
+        if prefetch_enabled:
+            prefetch_pool = ThreadPoolExecutor(max_workers=1)
+            first_end = min(args.chunk_size, len(examples))
+            next_images_future = prefetch_pool.submit(
+                _load_images,
+                resolved_paths[:first_end],
+                args.image_workers,
+            )
 
-            s = ci * args.chunk_size
-            e = min(s + args.chunk_size, len(examples))
-            chunk_exs = examples[s:e]
+        try:
+            for ci in range(n_chunks):
+                # Periodic engine restart to work around vLLM 0.11.2 memory leak
+                if args.restart_every and ci > 0 and ci % args.restart_every == 0:
+                    print(f"[restart] reinitializing engine after {args.restart_every} chunks", flush=True)
+                    llm = _restart_engine(llm)
 
-            n_ex = len(chunk_exs)
-            api_label = "llm.generate()" if args.base_model else "llm.chat()"
-            print(f"[chunk {ci + 1}/{n_chunks}] {n_ex} examples × n={n} [{api_label}]")
+                s = ci * args.chunk_size
+                e = min(s + args.chunk_size, len(examples))
+                chunk_exs = examples[s:e]
 
-            # Decode this chunk's images and build prompts now — and only
-            # now — so their memory can be reclaimed after the chunk.
-            chunk_images = [None] * (e - s) if args.no_image else _load_images(resolved_paths[s:e])
-            if args.base_model:
-                chunk_prompts = [
-                    _make_raw_prompt(ex, img, args.prompt_variant)
-                    for ex, img in zip(chunk_exs, chunk_images)
-                ]
-                outputs = llm.generate(chunk_prompts, sampling_params, use_tqdm=show_tqdm)
-            else:
-                chunk_convs = [
-                    _make_conversation(ex, img, args.prompt_variant)
-                    for ex, img in zip(chunk_exs, chunk_images)
-                ]
-                outputs = llm.chat(chunk_convs, sampling_params, use_tqdm=show_tqdm)
+                n_ex = len(chunk_exs)
+                api_label = "llm.generate()" if args.base_model else "llm.chat()"
+                print(f"[chunk {ci + 1}/{n_chunks}] {n_ex} examples × n={n} [{api_label}]")
 
-            for example, request_output in zip(chunk_exs, outputs):
-                all_texts = [co.text for co in request_output.outputs]
+                # Decode this chunk's images and build prompts now — and only
+                # now — so their memory can be reclaimed after the chunk.
+                load_start = time.perf_counter()
+                if args.no_image:
+                    chunk_images = [None] * (e - s)
+                elif prefetch_enabled:
+                    assert next_images_future is not None
+                    chunk_images = next_images_future.result()
+                    next_images_future = None
+                else:
+                    chunk_images = _load_images(resolved_paths[s:e], args.image_workers)
+                load_seconds = time.perf_counter() - load_start
 
-                if args.method == "naive-sampling":
-                    prediction = all_texts[0] if all_texts else ""
-                    # Verdict deferred to judge.
-                    result = {
-                        **example,
-                        "prediction": prediction,
-                        "method": "naive-sampling",
-                        "prompt_variant": args.prompt_variant,
-                        "sampling": f"temp={args.temperature}, top_p={args.top_p}, top_k={args.top_k}, n={n}",
-                        "n_samples": n,
-                        "success": None,
-                        "all_texts": all_texts,
-                    }
-                else:  # naive
-                    prediction = all_texts[0] if all_texts else ""
-                    result = {
-                        **example,
-                        "prediction": prediction,
-                        "method": "naive",
-                        "prompt_variant": args.prompt_variant,
-                        "sampling": f"temp={args.temperature}, top_p={args.top_p}, top_k={args.top_k}, n={n}",
-                    }
+                if prefetch_enabled and prefetch_pool is not None and e < len(examples):
+                    next_e = min(e + args.chunk_size, len(examples))
+                    next_images_future = prefetch_pool.submit(
+                        _load_images,
+                        resolved_paths[e:next_e],
+                        args.image_workers,
+                    )
 
-                append_jsonl(output_path, result)
+                prompt_start = time.perf_counter()
+                if args.base_model:
+                    chunk_prompts = [
+                        _make_raw_prompt(ex, img, args.prompt_variant)
+                        for ex, img in zip(chunk_exs, chunk_images)
+                    ]
+                    prompt_seconds = time.perf_counter() - prompt_start
+                    infer_start = time.perf_counter()
+                    outputs = llm.generate(chunk_prompts, sampling_params, use_tqdm=show_tqdm)
+                else:
+                    chunk_convs = [
+                        _make_conversation(ex, img, args.prompt_variant)
+                        for ex, img in zip(chunk_exs, chunk_images)
+                    ]
+                    prompt_seconds = time.perf_counter() - prompt_start
+                    infer_start = time.perf_counter()
+                    outputs = llm.chat(chunk_convs, sampling_params, use_tqdm=show_tqdm)
+                infer_seconds = time.perf_counter() - infer_start
 
-            # Drop chunk-local references so PIL buffers, processed mm
-            # inputs and RequestOutputs are reclaimable before next chunk.
-            del outputs, chunk_images
-            print(f"[chunk {ci + 1}/{n_chunks}] done — {e}/{len(examples)} examples", flush=True)
+                format_start = time.perf_counter()
+                chunk_results = []
+                for example, request_output in zip(chunk_exs, outputs):
+                    all_texts = [co.text for co in request_output.outputs]
+
+                    if args.method == "naive-sampling":
+                        prediction = all_texts[0] if all_texts else ""
+                        # Verdict deferred to judge.
+                        result = {
+                            **example,
+                            "prediction": prediction,
+                            "method": "naive-sampling",
+                            "prompt_variant": args.prompt_variant,
+                            "sampling": f"temp={args.temperature}, top_p={args.top_p}, top_k={args.top_k}, n={n}",
+                            "n_samples": n,
+                            "success": None,
+                            "all_texts": all_texts,
+                        }
+                    else:  # naive
+                        prediction = all_texts[0] if all_texts else ""
+                        result = {
+                            **example,
+                            "prediction": prediction,
+                            "method": "naive",
+                            "prompt_variant": args.prompt_variant,
+                            "sampling": f"temp={args.temperature}, top_p={args.top_p}, top_k={args.top_k}, n={n}",
+                        }
+
+                    chunk_results.append(result)
+                format_seconds = time.perf_counter() - format_start
+
+                write_start = time.perf_counter()
+                write_jsonl(output_path, chunk_results, append=True)
+                write_seconds = time.perf_counter() - write_start
+
+                # Drop chunk-local references so PIL buffers, processed mm
+                # inputs and RequestOutputs are reclaimable before next chunk.
+                del outputs, chunk_images, chunk_results
+                load_label = "load_wait" if prefetch_enabled else "load"
+                print(
+                    f"[chunk {ci + 1}/{n_chunks}] done — {e}/{len(examples)} examples "
+                    f"({load_label}={load_seconds:.1f}s prompt={prompt_seconds:.1f}s "
+                    f"infer={infer_seconds:.1f}s format={format_seconds:.1f}s "
+                    f"write={write_seconds:.1f}s)",
+                    flush=True,
+                )
+        finally:
+            if prefetch_pool is not None:
+                prefetch_pool.shutdown(wait=False, cancel_futures=True)
 
     print(f"Done. Output: {output_dir}")
 

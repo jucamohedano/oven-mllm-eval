@@ -245,10 +245,11 @@ class DirectMeasureMatcher:
 
     @staticmethod
     def _normalise(text: str) -> str:
+        # Mirror the reference normalize() (scores.normalize): keep Unicode
+        # letters, strip only ASCII punctuation ("España"→"españa").
         import re
-        text = text.lower().replace("_", " ").replace("-", " ")
-        text = re.sub(r"[^a-z0-9 ]+", " ", text)
-        return re.sub(r"\s+", " ", text).strip()
+        from oven_mllm_eval.scores import normalize
+        return re.sub(r"\s+", " ", normalize(text)).strip()
 
     @staticmethod
     def _stem(references: list[str], prediction: str) -> tuple[list[str], str]:
