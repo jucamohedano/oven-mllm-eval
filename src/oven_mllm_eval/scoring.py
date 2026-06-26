@@ -33,6 +33,58 @@ logger = logging.getLogger(__name__)
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+def _new_accum() -> dict:
+    return {
+        "hP": [],
+        "hR": [],
+        "hF": [],
+        "exact": [],
+        "mapped": 0,
+        "specific_hP": [],
+        "specific_hR": [],
+        "specific_hF": [],
+        "specific_exact": [],
+        "specific_mapped": 0,
+        "under_specific": [],
+        "over_specific": [],
+        "depth_delta": [],
+    }
+
+
+def _mean(values: list[float] | list[int]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+def _add_mapping_coverage_metrics(
+    metrics: dict,
+    *,
+    total: int,
+    mapped: int,
+    hP: list[float],
+    hR: list[float],
+    hF: list[float],
+    exact: list[int] | None = None,
+    prefix: str = "",
+) -> None:
+    """Add explicit mapped/unmapped and all-example zero-filled metrics.
+
+    The existing hP/hR/hF/exact fields are conditional on successful graph
+    mapping.  The *_all fields treat unmapped examples as zero, making coverage
+    effects visible in summary JSONs and downstream plots.
+    """
+    key_prefix = f"{prefix}_" if prefix else ""
+    coverage = mapped / total if total else 0.0
+    metrics.update({
+        f"{key_prefix}num_unmapped": max(total - mapped, 0),
+        f"{key_prefix}mapping_coverage": coverage,
+        f"{key_prefix}hP_all": sum(hP) / total if total else 0.0,
+        f"{key_prefix}hR_all": sum(hR) / total if total else 0.0,
+        f"{key_prefix}hF_all": sum(hF) / total if total else 0.0,
+    })
+    if exact is not None:
+        metrics[f"{key_prefix}exact_all"] = sum(exact) / total if total else 0.0
+
+
 def _derive_results_path(samples_path: Path) -> Path:
     """Derive the results JSON path from the samples or judged JSONL path.
 
@@ -78,8 +130,7 @@ def _score_rows(
     index = load_taxonomy_index(taxonomy_index_path)
     matchers = {m: DirectMeasureMatcher(index, ALL_MEASURES[m]) for m in measure_names}
 
-    accum = {m: {"hP": [], "hR": [], "hF": [], "exact": [], "mapped": 0}
-             for m in measure_names}
+    accum = {m: _new_accum() for m in measure_names}
     scored_rows = []
 
     total = len(rows)
@@ -123,12 +174,18 @@ def _score_rows(
 
         scored_row = {**row}
         for matcher_name, matcher in matchers.items():
-            # Best of the judge-correct candidates by hF for this measure.
+            # Best of the judge-correct candidates by original hF for this
+            # measure.  Also keep a separate best candidate under the
+            # specificity-aware score; this preserves existing metrics while
+            # exposing the stricter discriminative signal.
             result = None
+            specific_result = None
             for cand in candidates:
                 r = matcher.evaluate(cand, answer, reference_path=ref_path)
                 if result is None or r["hF"] > result["hF"]:
                     result = r
+                if specific_result is None or r["specific_hF"] > specific_result["specific_hF"]:
+                    specific_result = r
 
             prefix = matcher_name
             scored_row.update({
@@ -140,6 +197,16 @@ def _score_rows(
                 f"{prefix}_exact_match": result["success"],
                 f"{prefix}_mapping_method": result["mapping_method"],
                 f"{prefix}_scores": result["scores"],
+                f"{prefix}_specific_predicted_node": specific_result["predicted_node"],
+                f"{prefix}_specific_predicted_path": specific_result["predicted_path"],
+                f"{prefix}_specific_hP": specific_result["specific_hP"],
+                f"{prefix}_specific_hR": specific_result["specific_hR"],
+                f"{prefix}_specific_hF": specific_result["specific_hF"],
+                f"{prefix}_specific_exact_match": specific_result["success"],
+                f"{prefix}_specific_mapping_method": specific_result["mapping_method"],
+                f"{prefix}_under_specific": specific_result["under_specific"],
+                f"{prefix}_over_specific": specific_result["over_specific"],
+                f"{prefix}_depth_delta": specific_result["depth_delta"],
             })
 
             if result["predicted_path"] is not None and result["reference_path"] is not None:
@@ -148,6 +215,19 @@ def _score_rows(
                 accum[matcher_name]["hF"].append(result["hF"])
                 accum[matcher_name]["exact"].append(int(result["success"]))
                 accum[matcher_name]["mapped"] += 1
+            if (
+                specific_result["predicted_path"] is not None
+                and specific_result["reference_path"] is not None
+            ):
+                accum[matcher_name]["specific_hP"].append(specific_result["specific_hP"])
+                accum[matcher_name]["specific_hR"].append(specific_result["specific_hR"])
+                accum[matcher_name]["specific_hF"].append(specific_result["specific_hF"])
+                accum[matcher_name]["specific_exact"].append(int(specific_result["success"]))
+                accum[matcher_name]["under_specific"].append(int(specific_result["under_specific"]))
+                accum[matcher_name]["over_specific"].append(int(specific_result["over_specific"]))
+                if specific_result["depth_delta"] is not None:
+                    accum[matcher_name]["depth_delta"].append(specific_result["depth_delta"])
+                accum[matcher_name]["specific_mapped"] += 1
 
         scored_row["scored_reference_path"] = result["reference_path"]
         scored_rows.append(scored_row)
@@ -171,12 +251,15 @@ def _score_rollouts(scored_rows: list[dict], index: dict,
     (The distribution mean — the honest counterpart to this oracle ceiling — is
     a future TODO; see docs/rollout-hierarchical-metrics.md.)
     """
-    from oven_mllm_eval.scores import calc_hierarchical_metrics
+    from oven_mllm_eval.scores import (
+        calc_hierarchical_metrics,
+        calc_specificity_hierarchical_metrics,
+    )
     from oven_mllm_eval.matching import _normalise
 
     n2p = index.get("node_to_path", {})
     eid2p = index.get("entity_id_to_path", {})
-    accum = {"hP": [], "hR": [], "hF": [], "exact": [], "mapped": 0}
+    accum = _new_accum()
     method_counts: dict = {}
 
     for row in scored_rows:
@@ -193,20 +276,56 @@ def _score_rollouts(scored_rows: list[dict], index: dict,
         # Any mapped prediction shares the root → hF > 0, so the argmax always
         # prefers a mapped rollout over an unmapped one (hF = 0).
         best = None  # (hF, hP, hR, node, path, method)
+        specific_best = None  # (specific_hF, specific_hP, specific_hR, node, path, method, under, over, depth_delta)
         for t in set(texts):
             m = mapping.get(t) or {}
             pp = m.get("predicted_path")
             if pp is not None and ref_path is not None:
                 mt = calc_hierarchical_metrics([(pp, ref_path)])
                 hP, hR, hF = mt["hP"][0], mt["hR"][0], mt["hF"][0]
+                smt = calc_specificity_hierarchical_metrics([(pp, ref_path)])
+                specific_hP = smt["specific_hP"][0]
+                specific_hR = smt["specific_hR"][0]
+                specific_hF = smt["specific_hF"][0]
+                under_specific = smt["under_specific"][0]
+                over_specific = smt["over_specific"][0]
+                depth_delta = smt["depth_delta"][0]
             else:
                 hP = hR = hF = 0.0
+                specific_hP = specific_hR = specific_hF = 0.0
+                under_specific = over_specific = False
+                depth_delta = None
             if best is None or hF > best[0]:
                 best = (hF, hP, hR, m.get("predicted_node"), pp, m.get("mapping_method"))
+            if specific_best is None or specific_hF > specific_best[0]:
+                specific_best = (
+                    specific_hF,
+                    specific_hP,
+                    specific_hR,
+                    m.get("predicted_node"),
+                    pp,
+                    m.get("mapping_method"),
+                    under_specific,
+                    over_specific,
+                    depth_delta,
+                )
 
         if best is None:  # no rollouts
             best = (0.0, 0.0, 0.0, None, None, None)
+        if specific_best is None:
+            specific_best = (0.0, 0.0, 0.0, None, None, None, False, False, None)
         hF, hP, hR, pred_node, pred_path, method = best
+        (
+            specific_hF,
+            specific_hP,
+            specific_hR,
+            specific_pred_node,
+            specific_pred_path,
+            specific_method,
+            under_specific,
+            over_specific,
+            depth_delta,
+        ) = specific_best
         method_counts[method] = method_counts.get(method, 0) + 1
 
         if pred_path is not None and ref_path is not None:
@@ -218,6 +337,19 @@ def _score_rollouts(scored_rows: list[dict], index: dict,
             accum["mapped"] += 1
         else:
             exact = False
+        if specific_pred_path is not None and ref_path is not None:
+            specific_exact = _normalise(specific_pred_node or "") == _normalise(answer)
+            accum["specific_hP"].append(specific_hP)
+            accum["specific_hR"].append(specific_hR)
+            accum["specific_hF"].append(specific_hF)
+            accum["specific_exact"].append(int(specific_exact))
+            accum["under_specific"].append(int(under_specific))
+            accum["over_specific"].append(int(over_specific))
+            if depth_delta is not None:
+                accum["depth_delta"].append(depth_delta)
+            accum["specific_mapped"] += 1
+        else:
+            specific_exact = False
 
         row.update({
             "cascade_predicted_node": pred_node,
@@ -227,6 +359,16 @@ def _score_rollouts(scored_rows: list[dict], index: dict,
             "cascade_hF": hF,
             "cascade_exact_match": exact,
             "cascade_mapping_method": method,
+            "cascade_specific_predicted_node": specific_pred_node,
+            "cascade_specific_predicted_path": specific_pred_path,
+            "cascade_specific_hP": specific_hP,
+            "cascade_specific_hR": specific_hR,
+            "cascade_specific_hF": specific_hF,
+            "cascade_specific_exact_match": specific_exact,
+            "cascade_specific_mapping_method": specific_method,
+            "cascade_under_specific": under_specific,
+            "cascade_over_specific": over_specific,
+            "cascade_depth_delta": depth_delta,
         })
 
     return accum, method_counts
@@ -347,8 +489,7 @@ def score_generation_file(
                 break  # quick-test cap — stop reading early
 
     # Score lexical measures — parallel or serial
-    accum = {m: {"hP": [], "hR": [], "hF": [], "exact": [], "mapped": 0}
-             for m in lexical_names}
+    accum = {m: _new_accum() for m in lexical_names}
     if lexical_names:
         if num_workers > 1:
             # Contiguous chunks of roughly equal size.  All rows do the same
@@ -374,9 +515,14 @@ def score_generation_file(
         for chunk_rows, chunk_accum in results:
             scored_rows.extend(chunk_rows)
             for m in lexical_names:
-                for key in ("hP", "hR", "hF", "exact"):
+                for key in (
+                    "hP", "hR", "hF", "exact",
+                    "specific_hP", "specific_hR", "specific_hF", "specific_exact",
+                    "under_specific", "over_specific", "depth_delta",
+                ):
                     accum[m][key].extend(chunk_accum[m][key])
                 accum[m]["mapped"] += chunk_accum[m]["mapped"]
+                accum[m]["specific_mapped"] += chunk_accum[m]["specific_mapped"]
     else:
         scored_rows = [dict(r) for r in rows]
 
@@ -402,20 +548,44 @@ def score_generation_file(
     summaries = []
     for matcher_name in measure_names:
         a = accum[matcher_name]
-        if a["mapped"] > 0:
-            s = {
-                "hP": sum(a["hP"]) / len(a["hP"]),
-                "hR": sum(a["hR"]) / len(a["hR"]),
-                "hF": sum(a["hF"]) / len(a["hF"]),
-                "exact": sum(a["exact"]) / len(a["exact"]),
-                "num_examples": len(scored_rows),
-                "num_mapped": a["mapped"],
-            }
-        else:
-            s = {
-                "hP": 0.0, "hR": 0.0, "hF": 0.0, "exact": 0.0,
-                "num_examples": len(scored_rows), "num_mapped": 0,
-            }
+        total_examples = len(scored_rows)
+        s = {
+            "hP": _mean(a["hP"]),
+            "hR": _mean(a["hR"]),
+            "hF": _mean(a["hF"]),
+            "exact": _mean(a["exact"]),
+            "num_examples": total_examples,
+            "num_mapped": a["mapped"],
+        }
+        _add_mapping_coverage_metrics(
+            s,
+            total=total_examples,
+            mapped=a["mapped"],
+            hP=a["hP"],
+            hR=a["hR"],
+            hF=a["hF"],
+            exact=a["exact"],
+        )
+        s.update({
+            "specific_hP": _mean(a["specific_hP"]),
+            "specific_hR": _mean(a["specific_hR"]),
+            "specific_hF": _mean(a["specific_hF"]),
+            "specific_exact": _mean(a["specific_exact"]),
+            "specific_num_mapped": a["specific_mapped"],
+            "under_specific_rate": _mean(a["under_specific"]),
+            "over_specific_rate": _mean(a["over_specific"]),
+            "mean_depth_delta": _mean(a["depth_delta"]),
+        })
+        _add_mapping_coverage_metrics(
+            s,
+            total=total_examples,
+            mapped=a["specific_mapped"],
+            hP=a["specific_hP"],
+            hR=a["specific_hR"],
+            hF=a["specific_hF"],
+            exact=a["specific_exact"],
+            prefix="specific",
+        )
         summaries.append({"measure": matcher_name, "metrics": s})
 
     # Attach mapping-method breakdown (exact / ngram / voting / top_score /
@@ -573,35 +743,78 @@ def aggregate_scored_file(
         hF: list[float] = []
         exact: list[int] = []
         mapped = 0
+        specific_hP: list[float] = []
+        specific_hR: list[float] = []
+        specific_hF: list[float] = []
+        specific_exact: list[int] = []
+        under_specific: list[int] = []
+        over_specific: list[int] = []
+        depth_delta: list[float] = []
+        specific_mapped = 0
         for row in rows:
             reference_path = row.get("scored_reference_path")
             predicted_path = row.get(f"{matcher_name}_predicted_path")
             if predicted_path is None or reference_path is None:
-                continue
-            hP.append(float(row.get(f"{matcher_name}_hP", 0.0) or 0.0))
-            hR.append(float(row.get(f"{matcher_name}_hR", 0.0) or 0.0))
-            hF.append(float(row.get(f"{matcher_name}_hF", 0.0) or 0.0))
-            exact.append(int(bool(row.get(f"{matcher_name}_exact_match", False))))
-            mapped += 1
+                pass
+            else:
+                hP.append(float(row.get(f"{matcher_name}_hP", 0.0) or 0.0))
+                hR.append(float(row.get(f"{matcher_name}_hR", 0.0) or 0.0))
+                hF.append(float(row.get(f"{matcher_name}_hF", 0.0) or 0.0))
+                exact.append(int(bool(row.get(f"{matcher_name}_exact_match", False))))
+                mapped += 1
 
-        if mapped:
-            metrics = {
-                "hP": sum(hP) / len(hP),
-                "hR": sum(hR) / len(hR),
-                "hF": sum(hF) / len(hF),
-                "exact": sum(exact) / len(exact),
-                "num_examples": len(rows),
-                "num_mapped": mapped,
-            }
-        else:
-            metrics = {
-                "hP": 0.0,
-                "hR": 0.0,
-                "hF": 0.0,
-                "exact": 0.0,
-                "num_examples": len(rows),
-                "num_mapped": 0,
-            }
+            specific_predicted_path = row.get(f"{matcher_name}_specific_predicted_path")
+            if specific_predicted_path is None or reference_path is None:
+                continue
+            specific_hP.append(float(row.get(f"{matcher_name}_specific_hP", 0.0) or 0.0))
+            specific_hR.append(float(row.get(f"{matcher_name}_specific_hR", 0.0) or 0.0))
+            specific_hF.append(float(row.get(f"{matcher_name}_specific_hF", 0.0) or 0.0))
+            specific_exact.append(int(bool(row.get(f"{matcher_name}_specific_exact_match", False))))
+            under_specific.append(int(bool(row.get(f"{matcher_name}_under_specific", False))))
+            over_specific.append(int(bool(row.get(f"{matcher_name}_over_specific", False))))
+            delta = row.get(f"{matcher_name}_depth_delta")
+            if delta is not None:
+                depth_delta.append(float(delta))
+            specific_mapped += 1
+
+        total_examples = len(rows)
+        metrics = {
+            "hP": _mean(hP),
+            "hR": _mean(hR),
+            "hF": _mean(hF),
+            "exact": _mean(exact),
+            "num_examples": total_examples,
+            "num_mapped": mapped,
+        }
+        _add_mapping_coverage_metrics(
+            metrics,
+            total=total_examples,
+            mapped=mapped,
+            hP=hP,
+            hR=hR,
+            hF=hF,
+            exact=exact,
+        )
+        metrics.update({
+            "specific_hP": _mean(specific_hP),
+            "specific_hR": _mean(specific_hR),
+            "specific_hF": _mean(specific_hF),
+            "specific_exact": _mean(specific_exact),
+            "specific_num_mapped": specific_mapped,
+            "under_specific_rate": _mean(under_specific),
+            "over_specific_rate": _mean(over_specific),
+            "mean_depth_delta": _mean(depth_delta),
+        })
+        _add_mapping_coverage_metrics(
+            metrics,
+            total=total_examples,
+            mapped=specific_mapped,
+            hP=specific_hP,
+            hR=specific_hR,
+            hF=specific_hF,
+            exact=specific_exact,
+            prefix="specific",
+        )
         summaries.append({"measure": matcher_name, "metrics": metrics})
 
     _add_judge_metrics(summaries, rows)

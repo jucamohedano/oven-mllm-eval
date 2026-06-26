@@ -195,14 +195,20 @@ class DirectMeasureMatcher:
                 "predicted_path": None,
                 "reference_path": reference_path,
                 "hP": 0.0, "hR": 0.0, "hF": 0.0,
+                "specific_hP": 0.0, "specific_hR": 0.0, "specific_hF": 0.0,
+                "under_specific": False, "over_specific": False, "depth_delta": None,
                 "mapping_method": None,
                 "scores": None,
             }
 
-        from oven_mllm_eval.scores import calc_hierarchical_metrics
+        from oven_mllm_eval.scores import (
+            calc_hierarchical_metrics,
+            calc_specificity_hierarchical_metrics,
+        )
 
         pred_path = match["predicted_path"]
         metrics = calc_hierarchical_metrics([(pred_path, reference_path)])
+        specific_metrics = calc_specificity_hierarchical_metrics([(pred_path, reference_path)])
         # Mirror vlm-eval's check_topks / data.py: normalise both sides
         # before comparing so casing and punctuation differences don't
         # cause false negatives.
@@ -216,6 +222,12 @@ class DirectMeasureMatcher:
             "hP": metrics["hP"][0],
             "hR": metrics["hR"][0],
             "hF": metrics["hF"][0],
+            "specific_hP": specific_metrics["specific_hP"][0],
+            "specific_hR": specific_metrics["specific_hR"][0],
+            "specific_hF": specific_metrics["specific_hF"][0],
+            "under_specific": specific_metrics["under_specific"][0],
+            "over_specific": specific_metrics["over_specific"][0],
+            "depth_delta": specific_metrics["depth_delta"][0],
             "mapping_method": match["mapping_method"],
             "scores": match.get("scores"),
         }
