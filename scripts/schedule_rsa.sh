@@ -30,8 +30,9 @@ Slurm options:
 RSA options:
     --input <PATH>                Input naive-sampling samples JSONL (required)
     --output <PATH>               Output RSA samples JSONL
-                                  (default: <input>_rsa_nN_kK_tT.jsonl)
+                                  (default: <input>_rsa[_solution]_nN_kK_tT.jsonl)
     --model <MODEL>               Aggregator VLM (default: Qwen/Qwen3-VL-4B-Instruct)
+    --candidate-format <FORMAT>   answer or solution (default: answer)
     --prompt-variant <VARIANT>    source, concise_no_idk, concise, ... (default: source)
     --population <N>              RSA population size N (default: 16)
     --k <K>                       Aggregation subset size K (default: 4)
@@ -88,6 +89,7 @@ SLURM_NAME="oven-rsa"
 RSA_INPUT=""
 RSA_OUTPUT=""
 RSA_MODEL="Qwen/Qwen3-VL-4B-Instruct"
+RSA_CANDIDATE_FORMAT="answer"
 RSA_PROMPT_VARIANT="source"
 RSA_POPULATION="16"
 RSA_K="4"
@@ -135,6 +137,7 @@ main() {
             --input)              RSA_INPUT="$2"; shift 2 ;;
             --output)             RSA_OUTPUT="$2"; shift 2 ;;
             --model)              RSA_MODEL="$2"; shift 2 ;;
+            --candidate-format)   RSA_CANDIDATE_FORMAT="$2"; shift 2 ;;
             --prompt|--prompt-variant) RSA_PROMPT_VARIANT="$2"; shift 2 ;;
             --population)         RSA_POPULATION="$2"; shift 2 ;;
             --k)                  RSA_K="$2"; shift 2 ;;
@@ -187,6 +190,10 @@ main() {
         echo "[error] use only one of --resume or --overwrite" >&2
         exit 1
     fi
+    if [[ "$RSA_CANDIDATE_FORMAT" != "answer" && "$RSA_CANDIDATE_FORMAT" != "solution" ]]; then
+        echo "[error] --candidate-format must be answer or solution" >&2
+        exit 1
+    fi
 
     SLURM_ACCOUNT_DIRECTIVE=""
     if [[ -n "$SLURM_ACCOUNT" ]]; then
@@ -199,6 +206,7 @@ main() {
     echo "  Input:        $RSA_INPUT"
     echo "  Output:       ${RSA_OUTPUT:-<auto>}"
     echo "  Model:        $RSA_MODEL"
+    echo "  Format:       $RSA_CANDIDATE_FORMAT"
     echo "  RSA:          N=$RSA_POPULATION K=$RSA_K T=$RSA_STEPS"
     echo "  Max examples: ${RSA_MAX_EXAMPLES:-all}"
     echo "  Image root:   ${RSA_IMAGE_ROOT:-<cwd>}"
@@ -237,7 +245,7 @@ source .venv/bin/activate
 echo "[info] RSA job \$SLURM_JOB_ID on \$(hostname)"
 echo "  Input: $RSA_INPUT"
 echo "  Model: $RSA_MODEL"
-echo "  RSA:   N=$RSA_POPULATION K=$RSA_K T=$RSA_STEPS"
+echo "  RSA:   format=$RSA_CANDIDATE_FORMAT N=$RSA_POPULATION K=$RSA_K T=$RSA_STEPS"
 
 RSA_OUTPUT="$RSA_OUTPUT"
 RSA_MAX_EXAMPLES="$RSA_MAX_EXAMPLES"
@@ -247,6 +255,7 @@ RSA_IMAGE_ROOT="$RSA_IMAGE_ROOT"
 RSA_ARGS=(
     --input "$RSA_INPUT"
     --model "$RSA_MODEL"
+    --candidate-format "$RSA_CANDIDATE_FORMAT"
     --prompt-variant "$RSA_PROMPT_VARIANT"
     --population "$RSA_POPULATION"
     --k "$RSA_K"
@@ -274,7 +283,11 @@ if [[ "$RSA_ENFORCE_EAGER" == "1" ]]; then RSA_ARGS+=(--enforce-eager); fi
 if [[ -n "\$RSA_OUTPUT" ]]; then
     BASE_OUT="\$RSA_OUTPUT"
 else
-    BASE_OUT="\$(dirname "$RSA_INPUT")/\$(basename "$RSA_INPUT" .jsonl)_rsa_n${RSA_POPULATION}_k${RSA_K}_t${RSA_STEPS}.jsonl"
+    if [[ "$RSA_CANDIDATE_FORMAT" == "answer" ]]; then
+        BASE_OUT="\$(dirname "$RSA_INPUT")/\$(basename "$RSA_INPUT" .jsonl)_rsa_n${RSA_POPULATION}_k${RSA_K}_t${RSA_STEPS}.jsonl"
+    else
+        BASE_OUT="\$(dirname "$RSA_INPUT")/\$(basename "$RSA_INPUT" .jsonl)_rsa_${RSA_CANDIDATE_FORMAT}_n${RSA_POPULATION}_k${RSA_K}_t${RSA_STEPS}.jsonl"
+    fi
 fi
 
 if [[ $RSA_DP -le 1 ]]; then

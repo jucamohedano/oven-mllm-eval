@@ -4,11 +4,11 @@
 This adapts the population-update loop from ``../RSA/eval_loop.py`` and the
 paper in ``../resources/2509.26626v2.pdf`` to our OVEN setting.
 
-Unlike ``scripts/run_inference.py``, this script does not create the initial
-population itself.  It reads an existing ``*_samples.jsonl`` produced by
-``--method naive-sampling`` and treats each row's ``all_texts`` as P1.  It then
-recursively updates a fixed-size population by sampling K candidate answers and
-asking the VLM, with the image and question, to produce one improved answer.
+In the default ``--candidate-format answer`` mode, this script reads an existing
+``*_samples.jsonl`` produced by ``--method naive-sampling`` and treats each
+row's ``all_texts`` as P1.  In ``--candidate-format solution`` mode, it first
+generates a fresh P1 of concise solution traces ending in ``\boxed{...}``, then
+recursively aggregates solution traces.
 
 The output remains compatible with ``scripts/run_judge.py`` and
 ``scripts/score_predictions.py``: each row contains a final ``all_texts`` list
@@ -38,6 +38,7 @@ from oven_mllm_eval.prompts import PROMPT_VARIANTS, get_prompt
 
 
 RSA_METHOD = "recursive-self-aggregation"
+RSA_SYSTEM_PROMPT = "You are a careful visual problem solver for open-world image recognition."
 
 DOWNSTREAM_PREFIXES = (
     "judge_",
@@ -71,10 +72,9 @@ def _strip_downstream_fields(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _default_output_path(input_path: Path, population: int, k: int, steps: int) -> Path:
-    return input_path.with_name(
-        f"{input_path.stem}_rsa_n{population}_k{k}_t{steps}.jsonl"
-    )
+def _default_output_path(input_path: Path, population: int, k: int, steps: int, candidate_format: str) -> Path:
+    format_part = "" if candidate_format == "answer" else f"_{candidate_format}"
+    return input_path.with_name(f"{input_path.stem}_rsa{format_part}_n{population}_k{k}_t{steps}.jsonl")
 
 
 def _load_rows(path: Path, max_examples: int | None) -> list[dict[str, Any]]:
@@ -210,22 +210,62 @@ def _sample_subsets(
     return [rng.sample(population, k_eff) for _ in range(n_subsets)]
 
 
+def extract_boxed_answer(text: str) -> tuple[str, bool]:
+    """Extract the last ``\boxed{...}`` answer from a solution trace."""
+    matches = []
+    start = 0
+    needle = r"\boxed{"
+    while True:
+        box_start = text.find(needle, start)
+        if box_start < 0:
+            break
+        content_start = box_start + len(needle)
+        content_end = text.find("}", content_start)
+        if content_end < 0:
+            break
+        answer = text[content_start:content_end].strip()
+        if answer:
+            matches.append(answer)
+        start = content_end + 1
+    if matches:
+        return matches[-1].strip().strip(".").strip(), True
+    return text.strip(), False
+
+
+def build_oven_initial_solution_prompt(question: str) -> str:
+    return "\n".join(
+        [
+            "You are given an image and an open-world visual recognition problem.",
+            "Write a concise solution that uses the image, the question, and relevant visual or world knowledge to identify the most specific entity name.",
+            r"Reason carefully and end with the final answer in \boxed{}.",
+            "",
+            "Problem:",
+            question.strip(),
+            "",
+            r"Now write a concise solution. End with the final answer in \boxed{}.",
+        ]
+    )
+
+
 def build_oven_rsa_prompt(
     question: str,
-    candidate_answers: list[str],
+    candidates: list[str],
     prompt_variant: str,
+    candidate_format: str,
 ) -> str:
     """Build the OVEN adaptation of the RSA aggregation prompt.
 
     RSA's original prompt gives the problem plus K candidate reasoning chains.
-    Here the candidate objects are short OVEN entity/class answers, so the model
-    is asked to aggregate visual evidence and candidate labels into one concise
-    final answer instead of writing a long reasoning chain.
+    In answer mode candidates are short OVEN labels. In solution mode candidates
+    are full solution traces ending in ``\boxed{...}``.
     """
+    if candidate_format == "solution":
+        return build_oven_solution_aggregation_prompt(question, candidates)
+
     formatted_question = get_prompt(question, prompt_variant)
     parts: list[str] = []
 
-    if len(candidate_answers) == 1:
+    if len(candidates) == 1:
         parts.append(
             "You are given an image, a question about the image, and one candidate answer. "
             "The candidate may be incomplete or wrong. Use the image and the question "
@@ -244,15 +284,51 @@ def build_oven_rsa_prompt(
     parts.append("Question:\n")
     parts.append(formatted_question.strip() + "\n")
 
-    if len(candidate_answers) == 1:
+    if len(candidates) == 1:
         parts.append("Candidate answer (may contain mistakes):\n")
-        parts.append(f"---- Candidate ----\n{candidate_answers[0].strip()}\n")
+        parts.append(f"---- Candidate ----\n{candidates[0].strip()}\n")
         parts.append("Now write the improved final answer.")
     else:
         parts.append("Candidate answers (may contain mistakes):\n")
-        for i, answer in enumerate(candidate_answers, 1):
+        for i, answer in enumerate(candidates, 1):
             parts.append(f"---- Answer {i} ----\n{answer.strip()}\n")
         parts.append("Now write a single improved final answer.")
+
+    return "\n".join(parts)
+
+
+def build_oven_solution_aggregation_prompt(question: str, candidate_solutions: list[str]) -> str:
+    parts: list[str] = []
+    if len(candidate_solutions) == 1:
+        parts.append(
+            "You are given an open-world visual recognition problem and a candidate solution. "
+            "The candidate may be incomplete or contain errors. "
+            "Refine this trajectory and produce an improved, higher-quality solution. "
+            "If it is entirely wrong, attempt a new strategy. "
+            r"End with the final result in \boxed{}."
+        )
+    else:
+        parts.append(
+            "You are given an open-world visual recognition problem and several candidate solutions. "
+            "Some candidates may be incorrect or contain errors. "
+            "Aggregate the useful ideas and produce a single, high-quality solution. "
+            "Reason carefully; if candidates disagree, choose the path best supported by the image and question. "
+            "If all are incorrect, then attempt a different strategy. "
+            r"End with the final result in \boxed{}."
+        )
+
+    parts.append("\nProblem:\n")
+    parts.append(question.strip() + "\n")
+
+    if len(candidate_solutions) == 1:
+        parts.append("Candidate solution (may contain mistakes):\n")
+        parts.append(f"---- Candidate ----\n{candidate_solutions[0].strip()}\n")
+        parts.append(r"Now refine the candidate into an improved solution. Provide clear reasoning and end with the final answer in \boxed{}.")
+    else:
+        parts.append("Candidate solutions (may contain mistakes):\n")
+        for i, solution in enumerate(candidate_solutions, 1):
+            parts.append(f"---- Solution {i} ----\n{solution.strip()}\n")
+        parts.append(r"Now write a single improved solution. Provide clear reasoning and end with the final answer in \boxed{}.")
 
     return "\n".join(parts)
 
@@ -262,18 +338,27 @@ def _make_conversation(
     image: Image.Image | None,
     candidates: list[str],
     prompt_variant: str,
+    candidate_format: str,
+    initial_solution: bool = False,
 ) -> list[dict[str, Any]]:
     question = row.get("question")
     if question is None:
         raise KeyError(f"Example missing 'question' field. Available keys: {sorted(row.keys())}")
     if prompt_variant == "source":
         prompt_variant = row.get("prompt_variant") or "concise_no_idk"
-    prompt_text = build_oven_rsa_prompt(question, candidates, prompt_variant)
+    if initial_solution:
+        prompt_text = build_oven_initial_solution_prompt(question)
+    else:
+        prompt_text = build_oven_rsa_prompt(question, candidates, prompt_variant, candidate_format)
     content: list[dict[str, Any]] = []
     if image is not None:
         content.append({"type": "image_pil", "image_pil": image})
     content.append({"type": "text", "text": prompt_text})
-    return [{"role": "user", "content": content}]
+    messages: list[dict[str, Any]] = []
+    if candidate_format == "solution":
+        messages.append({"role": "system", "content": RSA_SYSTEM_PROMPT})
+    messages.append({"role": "user", "content": content})
+    return messages
 
 
 def _write_metadata(
@@ -289,6 +374,7 @@ def _write_metadata(
         "source_input": str(args.input),
         "output": str(output_path),
         "rsa": {
+            "candidate_format": args.candidate_format,
             "population": args.population,
             "k": args.k,
             "steps": args.steps,
@@ -296,6 +382,8 @@ def _write_metadata(
             "initial_selection": args.initial_selection,
             "seed": args.seed,
             "prompt_variant": args.prompt_variant,
+            "stores_populations_by_step": args.candidate_format == "solution",
+            "system_prompt": RSA_SYSTEM_PROMPT if args.candidate_format == "solution" else None,
             "reference": {
                 "paper": "../resources/2509.26626v2.pdf",
                 "code": "../RSA/eval_loop.py",
@@ -307,6 +395,7 @@ def _write_metadata(
             "top_k": args.top_k,
             "max_tokens": args.max_tokens,
             "n": 1,
+            "initial_n": args.population if args.candidate_format == "solution" else None,
         },
         "vllm": {
             "tensor_parallel_size": args.tp,
@@ -380,14 +469,15 @@ def _run_chunk(
     rng: random.Random,
     sampling_params: Any,
     show_tqdm: bool,
-) -> list[list[str]]:
+) -> tuple[list[list[str]], list[list[list[str]]] | None]:
     current = populations
+    populations_by_step = [[list(population) for population in current]] if args.candidate_format == "solution" else None
     for update_idx in range(1, args.steps):
         requests: list[list[dict[str, Any]]] = []
         for row, image, population in zip(rows, images, current):
             subsets = _sample_subsets(population, args.k, args.population, rng)
             for subset in subsets:
-                requests.append(_make_conversation(row, image, subset, args.prompt_variant))
+                requests.append(_make_conversation(row, image, subset, args.prompt_variant, args.candidate_format))
 
         print(
             f"  RSA update {update_idx}/{args.steps - 1}: "
@@ -402,18 +492,44 @@ def _run_chunk(
             texts[i:i + args.population]
             for i in range(0, len(texts), args.population)
         ]
-    return current
+        if populations_by_step is not None:
+            populations_by_step.append([list(population) for population in current])
+    return current, populations_by_step
+
+
+def _generate_initial_solution_populations(
+    llm: Any,
+    rows: list[dict[str, Any]],
+    images: list[Image.Image | None],
+    args: argparse.Namespace,
+    sampling_params: Any,
+    show_tqdm: bool,
+) -> list[list[str]]:
+    requests = [
+        _make_conversation(row, image, [], args.prompt_variant, "solution", initial_solution=True)
+        for row, image in zip(rows, images)
+    ]
+    print(f"  RSA initial solutions: {len(rows)} examples × N={args.population} prompts")
+    outputs = llm.chat(requests, sampling_params, use_tqdm=show_tqdm)
+    texts = [completion.text for output in outputs for completion in output.outputs]
+    expected = len(rows) * args.population
+    if len(texts) != expected:
+        raise RuntimeError(f"Expected {expected} initial solution outputs, got {len(texts)}")
+    return [texts[i:i + args.population] for i in range(0, len(texts), args.population)]
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run post-hoc Recursive Self-Aggregation over OVEN naive-sampling outputs."
     )
-    parser.add_argument("--input", required=True, type=Path, help="Input *_samples.jsonl with all_texts")
+    parser.add_argument("--input", required=True, type=Path, help="Input *_samples.jsonl rows to aggregate/evaluate")
     parser.add_argument("--output", type=Path, default=None,
-                        help="Output samples JSONL. Default: <input>_rsa_nN_kK_tT.jsonl")
+                        help="Output samples JSONL. Default: <input>_rsa[_solution]_nN_kK_tT.jsonl")
     parser.add_argument("--model", default="Qwen/Qwen3-VL-4B-Instruct",
                         help="Aggregator VLM model path or HF ID")
+    parser.add_argument("--candidate-format", choices=["answer", "solution"], default="answer",
+                        help="answer: current label-only RSA over all_texts; "
+                             "solution: generate and aggregate solution traces ending in \\boxed{}")
     parser.add_argument("--prompt-variant", default="source",
                         choices=["source", *PROMPT_VARIANTS.keys()],
                         help="Question formatting inside the RSA aggregation prompt. "
@@ -485,7 +601,13 @@ def main() -> None:
     if not args.input.exists():
         raise SystemExit(f"--input not found: {args.input}")
 
-    base_output = args.output or _default_output_path(args.input, args.population, args.k, args.steps)
+    base_output = args.output or _default_output_path(
+        args.input,
+        args.population,
+        args.k,
+        args.steps,
+        args.candidate_format,
+    )
     if args.num_shards > 1:
         if not (0 <= args.shard < args.num_shards):
             raise SystemExit(f"--shard must be in [0, {args.num_shards}), got {args.shard}")
@@ -511,8 +633,8 @@ def main() -> None:
         print(f"Shard {args.shard}/{args.num_shards}: {len(rows)} examples")
 
     missing_all_texts = sum(1 for row in rows if not row.get("all_texts"))
-    if missing_all_texts:
-        raise SystemExit(f"{missing_all_texts} rows have no all_texts; RSA requires naive-sampling outputs")
+    if args.candidate_format == "answer" and missing_all_texts:
+        raise SystemExit(f"{missing_all_texts} rows have no all_texts; answer-format RSA requires naive-sampling outputs")
 
     if args.resume:
         _clean_output_jsonl(output_path)
@@ -522,26 +644,44 @@ def main() -> None:
     else:
         done = set()
 
+    if not rows:
+        print(f"Input:  {args.input}")
+        print(f"Output: {output_path}")
+        print("No examples to process — exiting.")
+        return
+
     rng = random.Random(args.seed)
-    first_population = _initial_population(
-        rows[0].get("all_texts", []),
-        args.population,
-        args.initial_selection,
-        rng,
-    )
-    first_subset = _sample_subsets(first_population, args.k, 1, rng)[0]
-    preview = build_oven_rsa_prompt(
-        rows[0].get("question", ""),
-        first_subset,
-        (rows[0].get("prompt_variant") or "concise_no_idk")
-        if args.prompt_variant == "source"
-        else args.prompt_variant,
-    )
+    if args.candidate_format == "answer":
+        first_population = _initial_population(
+            rows[0].get("all_texts", []),
+            args.population,
+            args.initial_selection,
+            rng,
+        )
+        first_subset = _sample_subsets(first_population, args.k, 1, rng)[0]
+        preview = build_oven_rsa_prompt(
+            rows[0].get("question", ""),
+            first_subset,
+            (rows[0].get("prompt_variant") or "concise_no_idk")
+            if args.prompt_variant == "source"
+            else args.prompt_variant,
+            args.candidate_format,
+        )
+    else:
+        preview = "\n\n--- initial solution prompt ---\n"
+        preview += build_oven_initial_solution_prompt(rows[0].get("question", ""))
+        preview += "\n\n--- aggregation prompt preview ---\n"
+        preview += build_oven_rsa_prompt(
+            rows[0].get("question", ""),
+            [r"Candidate visual reasoning. \boxed{candidate entity}" for _ in range(args.k)],
+            "source",
+            args.candidate_format,
+        )
 
     print(f"Input:  {args.input}")
     print(f"Output: {output_path}")
     print(
-        f"RSA: N={args.population}, K={args.k}, T={args.steps} "
+        f"RSA: format={args.candidate_format}, N={args.population}, K={args.k}, T={args.steps} "
         f"({max(0, args.steps - 1)} aggregation update(s))"
     )
     print(f"Rows: input={input_rows}, to_process={len(rows)}, resumed={len(done)}")
@@ -550,10 +690,6 @@ def main() -> None:
         print("\n--- RSA prompt preview ---")
         print(preview)
         print("--- end preview ---")
-        return
-
-    if not rows:
-        print("No examples to process — exiting.")
         return
 
     if args.no_image:
@@ -582,6 +718,9 @@ def main() -> None:
     if args.top_k != -1:
         sampling_kwargs["top_k"] = args.top_k
     sampling_params = SamplingParams(**sampling_kwargs)
+    initial_sampling_kwargs = dict(sampling_kwargs)
+    initial_sampling_kwargs["n"] = args.population
+    initial_sampling_params = SamplingParams(**initial_sampling_kwargs)
 
     n_chunks = (len(rows) + args.chunk_size - 1) // args.chunk_size
     show_tqdm = args.num_shards <= 1  # \r redraws collide when shards share stdout
@@ -598,23 +737,33 @@ def main() -> None:
         print(f"[chunk {chunk_idx + 1}/{n_chunks}] examples {start}–{end - 1}")
 
         chunk_rng = random.Random(args.seed + start)
-        populations = [
-            _initial_population(
-                row.get("all_texts", []),
-                args.population,
-                args.initial_selection,
-                chunk_rng,
-            )
-            for row in chunk_rows
-        ]
-
         chunk_images: list[Image.Image | None]
         if args.no_image:
             chunk_images = [None] * len(chunk_rows)
         else:
             chunk_images = _load_images(resolved_paths[start:end])
 
-        final_populations = _run_chunk(
+        if args.candidate_format == "answer":
+            populations = [
+                _initial_population(
+                    row.get("all_texts", []),
+                    args.population,
+                    args.initial_selection,
+                    chunk_rng,
+                )
+                for row in chunk_rows
+            ]
+        else:
+            populations = _generate_initial_solution_populations(
+                llm=llm,
+                rows=chunk_rows,
+                images=chunk_images,
+                args=args,
+                sampling_params=initial_sampling_params,
+                show_tqdm=show_tqdm,
+            )
+
+        final_populations, populations_by_step = _run_chunk(
             llm=llm,
             rows=chunk_rows,
             images=chunk_images,
@@ -625,7 +774,7 @@ def main() -> None:
             show_tqdm=show_tqdm,
         )
 
-        for row, initial_population, final_population in zip(chunk_rows, populations, final_populations):
+        for row_idx, (row, initial_population, final_population) in enumerate(zip(chunk_rows, populations, final_populations)):
             source_n = len(row.get("all_texts", []))
             clean_row = _strip_downstream_fields(row)
             resolved_prompt_variant = (
@@ -633,30 +782,58 @@ def main() -> None:
                 if args.prompt_variant == "source"
                 else args.prompt_variant
             )
+            parsed_population = final_population
+            parse_flags: list[bool] = []
+            if args.candidate_format == "solution":
+                parsed_pairs = [extract_boxed_answer(text) for text in final_population]
+                parsed_population = [answer for answer, _ in parsed_pairs]
+                parse_flags = [ok for _, ok in parsed_pairs]
+
+            rsa_info = {
+                "source_method": row.get("method"),
+                "source_prompt_variant": row.get("prompt_variant"),
+                "source_n_samples": source_n,
+                "candidate_format": args.candidate_format,
+                "population": args.population,
+                "k": args.k,
+                "steps": args.steps,
+                "updates": max(0, args.steps - 1),
+                "initial_selection": args.initial_selection,
+                "seed": args.seed,
+            }
+            if args.candidate_format == "answer":
+                rsa_info["initial_population"] = initial_population
+
             out_row = {
                 **clean_row,
-                "prediction": final_population[0] if final_population else "",
+                "prediction": parsed_population[0] if parsed_population else "",
                 "method": RSA_METHOD,
                 "prompt_variant": resolved_prompt_variant,
+                "rsa_candidate_format": args.candidate_format,
                 "sampling": (
                     f"rsa: N={args.population}, K={args.k}, T={args.steps}; "
                     f"temp={args.temperature}, top_p={args.top_p}, top_k={args.top_k}, n=1"
                 ),
-                "n_samples": len(final_population),
-                "all_texts": final_population,
-                "rsa": {
-                    "source_method": row.get("method"),
-                    "source_prompt_variant": row.get("prompt_variant"),
-                    "source_n_samples": source_n,
-                    "population": args.population,
-                    "k": args.k,
-                    "steps": args.steps,
-                    "updates": max(0, args.steps - 1),
-                    "initial_selection": args.initial_selection,
-                    "initial_population": initial_population,
-                    "seed": args.seed,
-                },
+                "n_samples": len(parsed_population),
+                "all_texts": parsed_population,
+                "rsa": rsa_info,
             }
+            if args.candidate_format == "solution":
+                row_populations_by_step = (
+                    [step_populations[row_idx] for step_populations in populations_by_step]
+                    if populations_by_step is not None
+                    else [initial_population, final_population]
+                )
+                out_row.update(
+                    {
+                        "rsa_initial_solutions": initial_population,
+                        "rsa_populations_by_step": row_populations_by_step,
+                        "rsa_final_solutions": final_population,
+                        "rsa_raw_prediction": final_population[0] if final_population else "",
+                        "rsa_parse_ok": parse_flags[0] if parse_flags else False,
+                        "rsa_parse_ok_all": parse_flags,
+                    }
+                )
             append_jsonl(output_path, out_row)
 
         processed += len(chunk_rows)
