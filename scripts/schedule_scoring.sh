@@ -99,6 +99,7 @@ INF_JUDGE_TOP_P="1.0"
 INF_JUDGE_TOP_K="-1"
 INF_JUDGE_OUTPUT=""     # override judge output path (default: auto-derived)
 INF_JUDGE_WITH_DESC="0"
+INF_JUDGE_VENV=""          # override venv to source on compute node (auto if empty)
 INF_LABEL_CHAINS=""
 INF_DESC_CHAINS="data/raw/oven_wikidata_chains_cleaned_descs.jsonl"
 
@@ -149,6 +150,7 @@ main() {
             --judge-top-k)      INF_JUDGE_TOP_K="$2"; shift 2 ;;
             --judge-output)     INF_JUDGE_OUTPUT="$2"; shift 2 ;;
             --judge-with-desc)  INF_JUDGE_WITH_DESC="1"; shift ;;
+            --judge-venv)       INF_JUDGE_VENV="$2"; shift 2 ;;
             --label-chains)     INF_LABEL_CHAINS="$2"; shift 2 ;;
             --desc-chains)      INF_DESC_CHAINS="$2"; shift 2 ;;
             *) echo "Error: unknown option: $1" >&2; exit 1 ;;
@@ -221,11 +223,32 @@ main() {
     fi
 
     # Pre-flight: venv must exist
-    if [[ ! -x ".venv/bin/python" ]]; then
-        echo "Error: .venv/bin/python not found." >&2
-        echo "Build the venv on a login node first:" >&2
-        echo "    uv sync" >&2
+    # Resolve the venv to source on the compute node. Gemma-4 judges need the
+    # vLLM-0.19 build (different vllm version than Qwen); Qwen judges and
+    # score-only jobs use the project .venv. --judge-venv overrides auto-detect.
+    if [[ -n "$INF_JUDGE_VENV" ]]; then
+        JUDGE_VENV="$INF_JUDGE_VENV"
+    elif [[ -n "$INF_JUDGE_MODEL" && "$INF_JUDGE_MODEL" == *gemma* ]]; then
+        JUDGE_VENV="/leonardo_scratch/fast/EUHPC_D33_243/oven-mllm-eval/.vllm-0.19-venv/bin/activate"
+    else
+        JUDGE_VENV=".venv/bin/activate"
+    fi
+    JUDGE_VENV_DIR="${JUDGE_VENV%/bin/activate}"
+    if [[ ! -x "$JUDGE_VENV_DIR/bin/python" ]]; then
+        echo "Error: venv python not found: $JUDGE_VENV_DIR/bin/python" >&2
+        echo "  (venv: $JUDGE_VENV; override with --judge-venv <PATH>)" >&2
+        echo "  Build the venv on a login node first (uv sync, or the vLLM-0.19 build)." >&2
         exit 1
+    fi
+
+    # Module set: the vLLM-0.19 (Gemma) build was compiled against cuda/12.6 and
+    # needs that module at runtime (torch cu128 needs the 12.6+ CUDA runtime
+    # libs). Qwen judges use the nvhpc/24.5 stack that vLLM 0.11.2 ran with.
+    # Gate on the same gemma condition as the venv.
+    if [[ -n "$INF_JUDGE_MODEL" && "$INF_JUDGE_MODEL" == *gemma* ]]; then
+        JUDGE_MODULE_CMD="module purge; module load gcc/12.2.0; module load cuda/12.6"
+    else
+        JUDGE_MODULE_CMD="module load nvhpc/24.5 gcc/12.2.0"
     fi
 
     mkdir -p ./logs/slurm
@@ -235,6 +258,8 @@ main() {
     echo "  Output:       $SCORING_OUTPUT"
     echo "  Measure:      $SCORING_MEASURE"
     echo "  Workers:      $SCORING_NUM_WORKERS"
+    echo "  Venv:         $JUDGE_VENV"
+    echo "  Modules:      $JUDGE_MODULE_CMD"
     if [[ -n "$INF_JUDGE_MODEL" ]]; then
         echo "  Judge model:  $INF_JUDGE_MODEL  (GPUs=$INF_JUDGE_GPUS)"
         echo "  Judge mode:   $INF_JUDGE_MODE  (n=$INF_JUDGE_N, temp=$INF_JUDGE_TEMPERATURE, top_p=$INF_JUDGE_TOP_P, top_k=$INF_JUDGE_TOP_K)"
@@ -285,10 +310,10 @@ trap 'kill 0' EXIT
 
 cd "\$SLURM_SUBMIT_DIR"
 
-module load nvhpc/24.5 gcc/12.2.0
+$JUDGE_MODULE_CMD
 export CC=gcc CXX=g++ OMP_NUM_THREADS=1
 if [[ -f ".env" ]]; then set -a; source .env; set +a; fi
-source .venv/bin/activate
+source "$JUDGE_VENV"
 # Node-embedding cache location (point at \$WORK to keep it off the full FAST scratch).
 export OVEN_NODE_EMB_DIR="${OVEN_NODE_EMB_DIR:-/leonardo_work/EUHPC_D33_243/oven_node_emb}"
 
@@ -297,7 +322,6 @@ echo "  Input:    $SCORING_INPUT"
 echo "  Output:   $SCORING_OUTPUT"
 
 SAMPLES="$SCORING_INPUT"
-JUDGE_DESC_ARGS=()
 if [[ "$INF_JUDGE_WITH_DESC" == "1" ]]; then
     JUDGE_DESC_ARGS+=(--judge-with-desc --taxonomy-index "$SCORING_TAXONOMY_INDEX" --desc-chains "$INF_DESC_CHAINS")
     if [[ -n "$INF_LABEL_CHAINS" ]]; then
