@@ -1,14 +1,4 @@
-"""Semantic (cosine) retrieval of taxonomy nodes for prediction mapping.
-
-Builds and caches sentence-embedding vectors for all taxonomy node labels,
-then retrieves the top-k nearest nodes for a batch of predictions.  The
-retrieved top-k are fed into ``TaxonomyMatcher``'s cascade (exact / n-gram /
-voting) — this module only replaces the cascade's lexical Step 1 with cosine
-retrieval, matching the CVPR 2025 reference (the ``cascade`` measure).
-
-Node embeddings are computed once and cached to disk (keyed by model + the
-node set), so the expensive encode runs a single time across all runs.
-"""
+"""Semantic retrieval of taxonomy nodes for cascade mapping."""
 
 from __future__ import annotations
 
@@ -18,98 +8,156 @@ from pathlib import Path
 
 import numpy as np
 
-DEFAULT_MODEL = "sentence-transformers/all-mpnet-base-v2"
-# Cache location precedence: explicit arg → $OVEN_NODE_EMB_DIR → repo-local default.
-# On the cluster point $OVEN_NODE_EMB_DIR at $WORK so the cache is off the (full) FAST scratch.
+DEFAULT_BACKEND = "open_clip"
+DEFAULT_MODEL = "hf-hub:apple/DFN5B-CLIP-ViT-H-14"
 DEFAULT_CACHE_DIR = "data/processed/node_emb"
 
 
 class EmbeddingNodeIndex:
-    """Cached sentence-embedding index over taxonomy node labels."""
-
     def __init__(
         self,
         all_nodes: list[str],
+        *,
+        backend: str = DEFAULT_BACKEND,
         model_name: str = DEFAULT_MODEL,
         cache_dir: str | None = None,
         device: str = "cpu",
     ):
         self.all_nodes = list(all_nodes)
+        self.backend = backend
         self.model_name = model_name
         self.device = device
-        self.cache_dir = Path(cache_dir or os.environ.get("OVEN_NODE_EMB_DIR")
-                              or DEFAULT_CACHE_DIR)
+        self.cache_dir = Path(cache_dir or os.environ.get("OVEN_NODE_EMB_DIR") or DEFAULT_CACHE_DIR)
         self._model = None
+        self._tokenizer = None
         self.node_emb = self._build_or_load()
 
     def _cache_path(self) -> Path:
         key = hashlib.md5("\n".join(self.all_nodes).encode("utf-8")).hexdigest()[:12]
-        slug = self.model_name.split("/")[-1]
-        return self.cache_dir / f"{slug}_{key}.npy"
+        backend_slug = self.backend.replace("-", "_")
+        model_slug = hashlib.md5(self.model_name.encode("utf-8")).hexdigest()[:12]
+        return self.cache_dir / f"{backend_slug}_{model_slug}_{key}.npy"
 
     def _load_model(self):
-        if self._model is None:
+        if self._model is not None:
+            return self._model, self._tokenizer
+
+        if self.backend == "sentence_transformer":
             try:
                 from sentence_transformers import SentenceTransformer
-            except ImportError as e:  # pragma: no cover
+            except ImportError as exc:  # pragma: no cover
                 raise ImportError(
-                    "sentence-transformers is required for the 'cascade' measure "
-                    "measure. Install it with `uv sync` (it is declared in "
-                    "pyproject.toml) and download the model with "
-                    f"`hf download {self.model_name}`."
-                ) from e
+                    "sentence-transformers is required for backend='sentence_transformer'."
+                ) from exc
             self._model = SentenceTransformer(self.model_name, device=self.device)
-        return self._model
+            self._tokenizer = None
+            return self._model, self._tokenizer
+
+        if self.backend == "open_clip":
+            try:
+                import open_clip
+            except ImportError as exc:  # pragma: no cover
+                raise ImportError(
+                    "open_clip_torch is required for backend='open_clip'."
+                ) from exc
+            self._model, _ = open_clip.create_model_from_pretrained(self.model_name, device=self.device)
+            self._tokenizer = open_clip.get_tokenizer(self.model_name)
+            return self._model, self._tokenizer
+
+        raise ValueError(f"Unknown embedding backend '{self.backend}'.")
+
+    def _encode_texts(self, texts: list[str]) -> np.ndarray:
+        model, tokenizer = self._load_model()
+        if self.backend == "sentence_transformer":
+            return model.encode(
+                texts,
+                batch_size=256,
+                normalize_embeddings=True,
+                convert_to_numpy=True,
+                show_progress_bar=True,
+            )
+
+        import torch
+
+        outputs = []
+        batch_size = 256
+        total = len(texts)
+        num_batches = (total + batch_size - 1) // batch_size if total else 0
+        report_every = max(1, num_batches // 10) if num_batches else 1
+        print(
+            f"[embed] encoding {total:,} texts with {self.backend}:{self.model_name} "
+            f"on {self.device} (batch_size={batch_size})",
+            flush=True,
+        )
+        for start in range(0, len(texts), batch_size):
+            batch = texts[start:start + batch_size]
+            with torch.no_grad():
+                tokens = tokenizer(batch).to(self.device)
+                feats = model.encode_text(tokens)
+                feats = feats / feats.norm(dim=-1, keepdim=True)
+                outputs.append(feats.cpu().numpy())
+            batch_idx = start // batch_size + 1
+            if batch_idx % report_every == 0 or batch_idx == num_batches:
+                print(
+                    f"[embed] encoded batch {batch_idx}/{num_batches} "
+                    f"({min(start + batch_size, total):,}/{total:,} texts)",
+                    flush=True,
+                )
+        return np.concatenate(outputs, axis=0) if outputs else np.zeros((0, 1), dtype=np.float32)
 
     def _build_or_load(self) -> np.ndarray:
         cp = self._cache_path()
         if cp.exists():
             try:
-                return np.load(cp)
-            except (OSError, ValueError) as e:  # corrupt/partial cache → recompute
-                print(f"[embed] WARNING: cached {cp} unreadable ({e}); recomputing.",
-                      flush=True)
-        model = self._load_model()
-        print(f"[embed] encoding {len(self.all_nodes):,} taxonomy nodes "
-              f"with {self.model_name} (one-time, caching to {cp})", flush=True)
-        emb = model.encode(
-            self.all_nodes,
-            batch_size=256,
-            normalize_embeddings=True,
-            convert_to_numpy=True,
-            show_progress_bar=True,
+                emb = np.load(cp)
+                print(
+                    f"[embed] loaded cached taxonomy node embeddings from {cp} "
+                    f"(shape={emb.shape})",
+                    flush=True,
+                )
+                return emb
+            except (OSError, ValueError) as exc:
+                print(f"[embed] WARNING: cached {cp} unreadable ({exc}); recomputing.", flush=True)
+
+        print(
+            f"[embed] encoding {len(self.all_nodes):,} taxonomy nodes with {self.backend}:{self.model_name} "
+            f"(one-time, caching to {cp})",
+            flush=True,
         )
-        # Best-effort cache: a write failure (e.g. full/over-quota filesystem)
-        # must not kill scoring.  Write atomically so a failed write never
-        # leaves a corrupt cache for the next run.
+        emb = self._encode_texts(self.all_nodes)
         try:
             cp.parent.mkdir(parents=True, exist_ok=True)
             tmp = cp.parent / (cp.name + ".tmp")
             with open(tmp, "wb") as f:
                 np.save(f, emb)
             tmp.replace(cp)
-        except OSError as e:
-            print(f"[embed] WARNING: could not cache node embeddings to {cp} ({e}); "
-                  f"continuing without the cache (set $OVEN_NODE_EMB_DIR to a writable "
-                  f"location to enable caching).", flush=True)
+        except OSError as exc:
+            print(
+                f"[embed] WARNING: could not cache node embeddings to {cp} ({exc}); continuing without the cache.",
+                flush=True,
+            )
         return emb
 
-    def search(self, predictions: list[str], k: int = 3) -> list[tuple[list[int], list[float]]]:
-        """Cosine top-k node indices + scores for each prediction."""
-        from sentence_transformers.util import semantic_search
-
-        model = self._load_model()
-        pred_emb = model.encode(
-            list(predictions),
-            batch_size=256,
-            normalize_embeddings=True,
-            convert_to_numpy=True,
-            show_progress_bar=True,
+    def search(self, predictions: list[str], k: int = 10) -> list[tuple[list[int], list[float]]]:
+        print(
+            f"[embed] searching {len(predictions):,} unique predictions against "
+            f"{len(self.all_nodes):,} taxonomy nodes (top_k={k})",
+            flush=True,
         )
-        hits = semantic_search(pred_emb, self.node_emb, top_k=k)
+        pred_emb = self._encode_texts(list(predictions))
+        print("[embed] computing prediction-node similarity matrix", flush=True)
+        scores = pred_emb @ self.node_emb.T
+        print("[embed] extracting top-k taxonomy candidates", flush=True)
         out: list[tuple[list[int], list[float]]] = []
-        for row in hits:
-            out.append(([h["corpus_id"] for h in row], [float(h["score"]) for h in row]))
+        total = len(scores)
+        report_every = max(1, min(10000, total // 10)) if total else 1
+        for row in scores:
+            top_k = min(k, len(row))
+            candidate_idxs = np.argpartition(row, -top_k)[-top_k:]
+            idxs = candidate_idxs[np.argsort(row[candidate_idxs])[::-1]]
+            out.append((idxs.tolist(), [float(row[idx]) for idx in idxs]))
+            if len(out) % report_every == 0 or len(out) == total:
+                print(f"[embed] top-k extracted for {len(out):,}/{total:,} predictions", flush=True)
         return out
 
 
@@ -117,27 +165,30 @@ def build_prediction_mapping(
     predictions: list[str],
     index: dict,
     *,
+    backend: str = DEFAULT_BACKEND,
     model_name: str = DEFAULT_MODEL,
-    k: int = 3,
-    min_score: float = 0.35,
+    k: int = 10,
     device: str = "cpu",
     cache_dir: str | None = None,
 ) -> dict[str, dict]:
-    """Map each unique prediction → taxonomy node via cosine retrieval + cascade.
-
-    Returns ``{prediction: match_dict}`` where ``match_dict`` has
-    ``predicted_node`` / ``predicted_path`` / ``mapping_method`` (the latter is
-    ``"none"`` when the cosine score is below ``min_score`` and no lexical hit
-    is found).  The expensive embed + cascade runs once per *unique* prediction.
-    """
     from oven_mllm_eval.matching import TaxonomyMatcher
 
-    uniq = sorted({p for p in predictions if p})
-    node_index = EmbeddingNodeIndex(index["all_nodes"], model_name, cache_dir, device)
+    uniq = sorted({prediction for prediction in predictions if prediction})
+    node_index = EmbeddingNodeIndex(
+        index["all_nodes"],
+        backend=backend,
+        model_name=model_name,
+        cache_dir=cache_dir,
+        device=device,
+    )
     hits = node_index.search(uniq, k=k)
-    matcher = TaxonomyMatcher(index, k=k, min_score=min_score)
+    matcher = TaxonomyMatcher(index, k=k)
 
     mapping: dict[str, dict] = {}
-    for pred, (idxs, scores) in zip(uniq, hits):
-        mapping[pred] = matcher.match_prediction(pred, top_idxs=idxs, top_scores=scores)
+    print(f"[cascade] mapping {len(uniq):,} unique predictions with taxonomy cascade", flush=True)
+    report_every = max(1, min(10000, len(uniq) // 10)) if uniq else 1
+    for pred, (idxs, row_scores) in zip(uniq, hits):
+        mapping[pred] = matcher.match_prediction(pred, top_idxs=idxs, top_scores=row_scores)
+        if len(mapping) % report_every == 0 or len(mapping) == len(uniq):
+            print(f"[cascade] mapped {len(mapping):,}/{len(uniq):,} unique predictions", flush=True)
     return mapping

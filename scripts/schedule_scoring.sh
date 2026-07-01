@@ -311,7 +311,7 @@ trap 'kill 0' EXIT
 cd "\$SLURM_SUBMIT_DIR"
 
 $JUDGE_MODULE_CMD
-export CC=gcc CXX=g++ OMP_NUM_THREADS=1
+export CC=gcc CXX=g++ OMP_NUM_THREADS=1 PYTHONUNBUFFERED=1
 if [[ -f ".env" ]]; then set -a; source .env; set +a; fi
 source "$JUDGE_VENV"
 # Node-embedding cache location (point at \$WORK to keep it off the full FAST scratch).
@@ -403,12 +403,15 @@ python -m scripts.score_predictions \\
 # Clean up intermediate shard files only if a judge was used, scoring
 # succeeded, and row counts match between shards and merged files.
 if [[ -n "$INF_JUDGE_MODEL" ]] && [[ -s "$SCORING_OUTPUT" ]]; then
+    echo "[cleanup] checking intermediate judge shard files..."
     _shard_dir="\$(dirname "\$SAMPLES")"
     _jbase="\$(basename "\$JUDGED" .jsonl)"
+    echo "[cleanup] counting shard and merged judged rows..."
     _judge_shard_total=\$(cat "\${_shard_dir}"/\${_jbase}_shard*.jsonl 2>/dev/null | wc -l)
     _judge_total=\$(wc -l < "\$JUDGED" 2>/dev/null || echo 0)
 
     if [[ "\${_judge_shard_total}" -eq "\${_judge_total}" ]]; then
+        echo "[cleanup] removing intermediate shard files..."
         rm -f "\${_shard_dir}"/\${_jbase}_shard*.jsonl \
               "\${_shard_dir}"/shard*.log \
               "\${_shard_dir}"/engine_debug_shard*.log \

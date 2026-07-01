@@ -23,6 +23,7 @@ import logging
 import multiprocessing
 import os
 import re
+from collections import OrderedDict
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -53,6 +54,29 @@ def _new_accum() -> dict:
 
 def _mean(values: list[float] | list[int]) -> float:
     return sum(values) / len(values) if values else 0.0
+
+
+def _dedupe_rollout_texts(texts: list[str]) -> list[dict]:
+    """Return stable unique rollout records with counts and original indices."""
+    deduped: OrderedDict[str, dict] = OrderedDict()
+    for idx, text in enumerate(texts):
+        if not text:
+            continue
+        record = deduped.setdefault(text, {"text": text, "count": 0, "indices": []})
+        record["count"] += 1
+        record["indices"].append(idx)
+    return list(deduped.values())
+
+
+def _row_rollout_records(row: dict) -> list[dict]:
+    records = _dedupe_rollout_texts(row.get("all_texts") or [])
+    if records:
+        return records
+    fallback = (row.get("judge_selected_text")
+                or row.get("prediction")
+                or row.get("iter_final_prediction")
+                or row.get("output", ""))
+    return [{"text": fallback, "count": 1, "indices": []}]
 
 
 def _add_mapping_coverage_metrics(
@@ -141,24 +165,7 @@ def _score_rows(
                   .replace("<answer>", "").replace("</answer>", "")
                   .replace("<s>", "").replace("</s>", "")
                   .strip())
-        # Candidate answers: the UNIQUE answers the judge tagged correct (the
-        # judge prunes the answer space).  Among them we report the best-
-        # mapping one per measure — more robust than the arbitrary first
-        # correct rollout, which may be an unmappable paraphrase.  Fall back to
-        # the single judge-selected / raw prediction when the judge tagged
-        # nothing correct (or did not run).
-        verdicts = row.get("judge_verdicts") or []
-        all_texts = row.get("all_texts") or []
-        candidates = list(dict.fromkeys(
-            all_texts[j]
-            for j in range(min(len(all_texts), len(verdicts)))
-            if verdicts[j]
-        ))
-        if not candidates:
-            candidates = [(row.get("judge_selected_text")
-                           or row.get("prediction")
-                           or row.get("iter_final_prediction")
-                           or row.get("output", ""))]
+        rollout_records = _row_rollout_records(row)
         entity_id = row.get("entity_id")
 
         # Look up reference path once (shared across measures)
@@ -174,14 +181,36 @@ def _score_rows(
 
         scored_row = {**row}
         for matcher_name, matcher in matchers.items():
-            # Best of the judge-correct candidates by original hF for this
-            # measure.  Also keep a separate best candidate under the
+            # Best of the deduped rollout texts by original hF for this
+            # measure. Also keep a separate best candidate under the
             # specificity-aware score; this preserves existing metrics while
             # exposing the stricter discriminative signal.
             result = None
             specific_result = None
-            for cand in candidates:
-                r = matcher.evaluate(cand, answer, reference_path=ref_path)
+            rollout_metrics = []
+            for rollout_record in rollout_records:
+                r = matcher.evaluate(rollout_record["text"], answer, reference_path=ref_path)
+                metric_record = {
+                    "text": rollout_record["text"],
+                    "count": rollout_record["count"],
+                    "indices": rollout_record["indices"],
+                    "predicted_node": r["predicted_node"],
+                    "predicted_path": r["predicted_path"],
+                    "hP": r["hP"],
+                    "hR": r["hR"],
+                    "hF": r["hF"],
+                    "exact_match": r["success"],
+                    "mapping_method": r["mapping_method"],
+                    "scores": r["scores"],
+                    "specific_hP": r["specific_hP"],
+                    "specific_hR": r["specific_hR"],
+                    "specific_hF": r["specific_hF"],
+                    "specific_exact_match": r["success"],
+                    "under_specific": r["under_specific"],
+                    "over_specific": r["over_specific"],
+                    "depth_delta": r["depth_delta"],
+                }
+                rollout_metrics.append(metric_record)
                 if result is None or r["hF"] > result["hF"]:
                     result = r
                 if specific_result is None or r["specific_hF"] > specific_result["specific_hF"]:
@@ -197,6 +226,7 @@ def _score_rows(
                 f"{prefix}_exact_match": result["success"],
                 f"{prefix}_mapping_method": result["mapping_method"],
                 f"{prefix}_scores": result["scores"],
+                f"{prefix}_rollout_metrics": rollout_metrics,
                 f"{prefix}_specific_predicted_node": specific_result["predicted_node"],
                 f"{prefix}_specific_predicted_path": specific_result["predicted_path"],
                 f"{prefix}_specific_hP": specific_result["specific_hP"],
@@ -248,8 +278,9 @@ def _score_rollouts(scored_rows: list[dict], index: dict,
     rollout with the highest hF is selected and *its* (hP, hR, hF) reported.
     The expensive embed + cascade already ran once per unique rollout string.
 
-    (The distribution mean — the honest counterpart to this oracle ceiling — is
-    a future TODO; see docs/rollout-hierarchical-metrics.md.)
+    Per-rollout metrics are persisted in deduped form so downstream analysis can
+    compute frequency-weighted means, variances, quantiles, and judge-conditioned
+    diagnostics without remapping.
     """
     from oven_mllm_eval.scores import (
         calc_hierarchical_metrics,
@@ -261,8 +292,12 @@ def _score_rollouts(scored_rows: list[dict], index: dict,
     eid2p = index.get("entity_id_to_path", {})
     accum = _new_accum()
     method_counts: dict = {}
+    total = len(scored_rows)
+    report_every = max(1, min(1000, total // 10)) if total else 1
 
-    for row in scored_rows:
+    print(f"[cascade] scoring per-row rollout metrics for {total:,} rows", flush=True)
+
+    for row_idx, row in enumerate(scored_rows, start=1):
         answer = (row.get("answer", "")
                   .replace("A: ", "").replace("A:", "")
                   .replace("<answer>", "").replace("</answer>", "")
@@ -270,15 +305,17 @@ def _score_rollouts(scored_rows: list[dict], index: dict,
                   .strip())
         entity_id = row.get("entity_id")
         ref_path = n2p.get(answer) or (eid2p.get(entity_id) if entity_id else None)
-        texts = row.get("all_texts") or []
+        rollout_records = _row_rollout_records(row)
 
         # Best-of-N: score each unique rollout once, keep the highest-hF one.
         # Any mapped prediction shares the root → hF > 0, so the argmax always
         # prefers a mapped rollout over an unmapped one (hF = 0).
         best = None  # (hF, hP, hR, node, path, method)
         specific_best = None  # (specific_hF, specific_hP, specific_hR, node, path, method, under, over, depth_delta)
-        for t in set(texts):
-            m = mapping.get(t) or {}
+        rollout_metrics = []
+        for rollout_record in rollout_records:
+            text = rollout_record["text"]
+            m = mapping.get(text) or {}
             pp = m.get("predicted_path")
             if pp is not None and ref_path is not None:
                 mt = calc_hierarchical_metrics([(pp, ref_path)])
@@ -295,6 +332,30 @@ def _score_rollouts(scored_rows: list[dict], index: dict,
                 specific_hP = specific_hR = specific_hF = 0.0
                 under_specific = over_specific = False
                 depth_delta = None
+            exact_for_rollout = (
+                _normalise(m.get("predicted_node") or "") == _normalise(answer)
+                if pp is not None and ref_path is not None
+                else False
+            )
+            rollout_metrics.append({
+                "text": text,
+                "count": rollout_record["count"],
+                "indices": rollout_record["indices"],
+                "predicted_node": m.get("predicted_node"),
+                "predicted_path": pp,
+                "hP": hP,
+                "hR": hR,
+                "hF": hF,
+                "exact_match": exact_for_rollout,
+                "mapping_method": m.get("mapping_method"),
+                "specific_hP": specific_hP,
+                "specific_hR": specific_hR,
+                "specific_hF": specific_hF,
+                "specific_exact_match": exact_for_rollout,
+                "under_specific": under_specific,
+                "over_specific": over_specific,
+                "depth_delta": depth_delta,
+            })
             if best is None or hF > best[0]:
                 best = (hF, hP, hR, m.get("predicted_node"), pp, m.get("mapping_method"))
             if specific_best is None or specific_hF > specific_best[0]:
@@ -359,6 +420,7 @@ def _score_rollouts(scored_rows: list[dict], index: dict,
             "cascade_hF": hF,
             "cascade_exact_match": exact,
             "cascade_mapping_method": method,
+            "cascade_rollout_metrics": rollout_metrics,
             "cascade_specific_predicted_node": specific_pred_node,
             "cascade_specific_predicted_path": specific_pred_path,
             "cascade_specific_hP": specific_hP,
@@ -370,6 +432,9 @@ def _score_rollouts(scored_rows: list[dict], index: dict,
             "cascade_over_specific": over_specific,
             "cascade_depth_delta": depth_delta,
         })
+
+        if row_idx % report_every == 0 or row_idx == total:
+            print(f"[cascade] scored rollout metrics for {row_idx:,}/{total:,} rows", flush=True)
 
     return accum, method_counts
 
@@ -385,9 +450,9 @@ def score_generation_file(
     summary_path: Optional[str | Path] = None,
     measure: str | Sequence[str] = "exact_match",
     num_workers: int = 1,
-    embed_model: str = "sentence-transformers/all-mpnet-base-v2",
-    map_top_k: int = 3,
-    map_min_score: float = 0.35,
+    embed_model: str = "hf-hub:apple/DFN5B-CLIP-ViT-H-14",
+    embed_backend: str = "open_clip",
+    map_top_k: int = 10,
     embed_device: str = "cpu",
     max_examples: int | None = None,
 ) -> dict | list[dict]:
@@ -478,6 +543,7 @@ def score_generation_file(
         resolved_index_path = str(Path(taxonomy_index_path))
 
     # Read all rows
+    print(f"[score] reading input rows from {input_path}", flush=True)
     rows = []
     with open(input_path, "r") as f:
         for line in f:
@@ -487,10 +553,16 @@ def score_generation_file(
             rows.append(json.loads(line))
             if max_examples and len(rows) >= max_examples:
                 break  # quick-test cap — stop reading early
+    print(
+        f"[score] loaded {len(rows):,} rows; measures={measure_names}; "
+        f"workers={num_workers}; output={output_path}; summary={summary_path}",
+        flush=True,
+    )
 
     # Score lexical measures — parallel or serial
     accum = {m: _new_accum() for m in lexical_names}
     if lexical_names:
+        print(f"[score] scoring lexical/direct measures: {lexical_names}", flush=True)
         if num_workers > 1:
             # Contiguous chunks of roughly equal size.  All rows do the same
             # work (one prediction vs ~12K node labels), so round-robin isn't
@@ -498,6 +570,11 @@ def score_generation_file(
             chunk_size = (len(rows) + num_workers - 1) // num_workers
             chunks = [rows[i:i + chunk_size] for i in range(0, len(rows), chunk_size)]
             args = [(chunk, lexical_names, resolved_index_path) for chunk in chunks]
+            print(
+                f"[score] launched {len(chunks)} scoring chunks "
+                f"(chunk_size~{chunk_size:,})",
+                flush=True,
+            )
 
             try:
                 with multiprocessing.Pool(num_workers) as pool:
@@ -511,6 +588,7 @@ def score_generation_file(
         else:
             results = [_score_rows((rows, lexical_names, resolved_index_path))]
 
+        print("[score] merging scored chunks and accumulators", flush=True)
         scored_rows = []
         for chunk_rows, chunk_accum in results:
             scored_rows.extend(chunk_rows)
@@ -523,8 +601,10 @@ def score_generation_file(
                     accum[m][key].extend(chunk_accum[m][key])
                 accum[m]["mapped"] += chunk_accum[m]["mapped"]
                 accum[m]["specific_mapped"] += chunk_accum[m]["specific_mapped"]
+        print(f"[score] merged {len(scored_rows):,} scored rows", flush=True)
     else:
         scored_rows = [dict(r) for r in rows]
+        print("[score] no lexical/direct measures requested", flush=True)
 
     # Score the embedding measure (cosine retrieval → cascade), single pass.
     embed_method_counts: dict | None = None
@@ -532,19 +612,36 @@ def score_generation_file(
         from oven_mllm_eval.taxonomy import load_taxonomy_index
         from oven_mllm_eval.embedding_matcher import build_prediction_mapping
 
+        print(f"[cascade] loading taxonomy index from {resolved_index_path}", flush=True)
         _index = load_taxonomy_index(resolved_index_path)
         # Best-of-N: map every rollout (deduped internally by build_prediction_mapping),
         # not a single representative prediction.
-        _rollouts = [t for r in scored_rows for t in (r.get("all_texts") or [])]
-        _mapping = build_prediction_mapping(
-            _rollouts, _index, model_name=embed_model, k=map_top_k,
-            min_score=map_min_score, device=embed_device,
+        _rollouts = [
+            record["text"]
+            for row in scored_rows
+            for record in _row_rollout_records(row)
+        ]
+        _unique_rollouts = len({r for r in _rollouts if r})
+        print(
+            f"[cascade] collected {len(_rollouts):,} deduped-per-row rollout records "
+            f"({_unique_rollouts:,} globally unique texts)",
+            flush=True,
         )
+        _mapping = build_prediction_mapping(
+            _rollouts,
+            _index,
+            backend=embed_backend,
+            model_name=embed_model,
+            k=map_top_k,
+            device=embed_device,
+        )
+        print(f"[cascade] built mapping for {len(_mapping):,} unique texts", flush=True)
         accum[EMBED_MEASURE], embed_method_counts = _score_rollouts(
             scored_rows, _index, _mapping
         )
 
     # Aggregate per measure
+    print("[score] aggregating per-measure summaries", flush=True)
     summaries = []
     for matcher_name in measure_names:
         a = accum[matcher_name]
@@ -588,8 +685,8 @@ def score_generation_file(
         )
         summaries.append({"measure": matcher_name, "metrics": s})
 
-    # Attach mapping-method breakdown (exact / ngram / voting / top_score /
-    # none) to the embedding measure for auditability.
+    # Attach mapping-method breakdown (exact / ngram / voting / top_score)
+    # to the embedding measure for auditability.
     if embed_method_counts is not None:
         for _s in summaries:
             if _s["measure"] == EMBED_MEASURE:
@@ -604,6 +701,7 @@ def score_generation_file(
 
     _judge_rows = [r for r in scored_rows if r.get("judge_verdicts")]
     if _judge_rows:
+        print(f"[score] computing pass@k from {len(_judge_rows):,} judged rows", flush=True)
         _ns = [len(r["judge_verdicts"]) for r in _judge_rows]
         _n_max = max(_ns) if _ns else 0
         _candidate_ks = [2**i for i in range(0, 12)]  # 1, 2, 4, 8, ..., 2048
@@ -655,15 +753,20 @@ def score_generation_file(
     # Drop stale unprefixed keys from old scoring runs so rows stay clean
     _STALE_KEYS = {"scored_predicted_node", "scored_predicted_path",
                    "hP", "hR", "hF", "exact_match", "mapping_method"}
+    print("[score] removing stale unprefixed score keys", flush=True)
     for row in scored_rows:
         for k in _STALE_KEYS:
             row.pop(k, None)
 
     # Write per-sample scored JSONL (overwrites input by default)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"[score] writing {len(scored_rows):,} scored rows to {output_path}", flush=True)
+    write_report_every = max(1, min(1000, len(scored_rows) // 10)) if scored_rows else 1
     with open(output_path, "w") as f:
-        for row in scored_rows:
+        for row_idx, row in enumerate(scored_rows, start=1):
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            if row_idx % write_report_every == 0 or row_idx == len(scored_rows):
+                print(f"[score] wrote {row_idx:,}/{len(scored_rows):,} scored rows", flush=True)
 
     # Write aggregate results JSON
     summary_path.parent.mkdir(parents=True, exist_ok=True)
@@ -687,8 +790,10 @@ def score_generation_file(
         _summary_data["judge_model"] = _jmeta.get("judge_model", "unknown")
         _summary_data["judge_mode"] = _jmeta.get("judge_mode", "unknown")
 
+    print(f"[score] writing summary JSON to {summary_path}", flush=True)
     with open(summary_path, "w") as f:
         json.dump(_summary_data, f, indent=2)
+    print("[score] scoring complete", flush=True)
 
     return summaries[0]["metrics"] if len(summaries) == 1 else summaries
 
