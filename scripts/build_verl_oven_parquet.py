@@ -127,6 +127,20 @@ def load_chain_file(path: Path | None) -> dict[str, list[str]]:
     return chains
 
 
+def _strip_latex_answer(answer: str) -> str:
+    answer = answer.strip().strip("$").strip().strip(".").strip()
+    wrappers = (r"\text", r"\mathrm", r"\operatorname", r"\mathbf")
+    changed = True
+    while changed:
+        changed = False
+        for wrapper in wrappers:
+            prefix = wrapper + "{"
+            if answer.startswith(prefix) and answer.endswith("}"):
+                answer = answer[len(prefix):-1].strip()
+                changed = True
+    return answer.strip().strip("$").strip().strip(".").strip()
+
+
 def extract_boxed_answer(text: str) -> tuple[str, bool]:
     matches = []
     start = 0
@@ -136,15 +150,24 @@ def extract_boxed_answer(text: str) -> tuple[str, bool]:
         if box_start < 0:
             break
         content_start = box_start + len(needle)
-        content_end = text.find("}", content_start)
-        if content_end < 0:
+        depth = 1
+        idx = content_start
+        while idx < len(text) and depth > 0:
+            char = text[idx]
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+            idx += 1
+        if depth == 0:
+            answer = _strip_latex_answer(text[content_start:idx - 1])
+            if answer:
+                matches.append(answer)
+            start = idx
+        else:
             break
-        answer = text[content_start:content_end].strip()
-        if answer:
-            matches.append(answer)
-        start = content_end + 1
     if matches:
-        return matches[-1].strip().strip(".").strip(), True
+        return matches[-1], True
     return text.strip(), False
 
 
@@ -207,19 +230,52 @@ def select_val_qids(qids: set[str], fraction: float, seed: int) -> set[str]:
     return set(ordered[:count])
 
 
-def image_uri(row: dict[str, Any], image_root: str | None) -> str:
-    path = row.get("image_path")
-    if not path and image_root and row.get("image_id"):
-        path = str(Path(image_root) / f"{row['image_id']}.jpg")
-    if not path:
-        raise ValueError(f"row has no image_path and no usable image_id: {row.get('data_id')}")
+def _path_variants(path: Path) -> list[Path]:
+    variants = [path]
+    for ext in (".jpg", ".jpeg", ".JPEG", ".JPG", ".png", ".PNG", ".webp", ".WEBP"):
+        if path.suffix != ext:
+            variants.append(path.with_suffix(ext))
+    return variants
 
-    path = str(path)
+
+def image_uri(row: dict[str, Any], image_root: str | None) -> str:
+    path = str(row.get("image_path") or "")
     if path.startswith(("file://", "http://", "https://")):
         return path
-    if Path(path).is_absolute():
-        return f"file://{path}"
-    return path
+
+    image_id = str(row.get("image_id") or "")
+    if not path and not image_id:
+        raise ValueError(f"row has no image_path and no usable image_id: {row.get('data_id')}")
+
+    root = Path(image_root) if image_root else Path.cwd()
+    candidates: list[Path] = []
+    names: list[str] = []
+    if path:
+        raw = Path(path)
+        candidates.append(raw if raw.is_absolute() else root / raw)
+        names.append(raw.name)
+    if image_id:
+        names.append(f"{image_id}.jpg")
+
+    for search_root in (root, root / "data" / "images", root / "images"):
+        for name in names:
+            if name:
+                candidates.append(search_root / name)
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        for variant in _path_variants(candidate):
+            key = str(variant)
+            if key in seen:
+                continue
+            seen.add(key)
+            if variant.exists():
+                return f"file://{variant}"
+
+    raw_path = Path(path) if path else root / f"{image_id}.jpg"
+    if raw_path.is_absolute():
+        return f"file://{raw_path}"
+    return str(raw_path)
 
 
 def ancestor_evidence(

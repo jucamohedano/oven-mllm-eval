@@ -67,6 +67,10 @@ vLLM engine options:
     --chunk-size <N>              Examples per chunk (default: 32)
     --restart-every <N>           Restart vLLM every N chunks (default: 0 = never)
     --enforce-eager               Disable CUDA graphs
+
+Cache options:
+    RSA_CACHE_ROOT=<PATH>          Optional env override for per-job vLLM/Torch compile caches.
+                                  Default: <parent-of-repo>/.rsa_compile_cache
 '
     exit 0
 fi
@@ -118,6 +122,7 @@ RSA_MIN_PIXELS="65536"
 RSA_CHUNK_SIZE="32"
 RSA_RESTART_EVERY="0"
 RSA_ENFORCE_EAGER="0"
+RSA_CACHE_ROOT="${RSA_CACHE_ROOT:-}"
 
 main() {
     while [[ $# -gt 0 ]]; do
@@ -242,10 +247,20 @@ export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
 if [[ -f ".env" ]]; then set -a; source .env; set +a; fi
 source .venv/bin/activate
 
+RSA_CACHE_ROOT="$RSA_CACHE_ROOT"
+if [[ -z "\$RSA_CACHE_ROOT" ]]; then
+    RSA_CACHE_ROOT="\$(dirname "\$SLURM_SUBMIT_DIR")/.rsa_compile_cache"
+fi
+export VLLM_CACHE_ROOT="\${VLLM_CACHE_ROOT:-\$RSA_CACHE_ROOT/vllm/\$SLURM_JOB_ID}"
+export TORCHINDUCTOR_CACHE_DIR="\${TORCHINDUCTOR_CACHE_DIR:-\$RSA_CACHE_ROOT/torchinductor/\$SLURM_JOB_ID}"
+mkdir -p "\$VLLM_CACHE_ROOT" "\$TORCHINDUCTOR_CACHE_DIR"
+
 echo "[info] RSA job \$SLURM_JOB_ID on \$(hostname)"
 echo "  Input: $RSA_INPUT"
 echo "  Model: $RSA_MODEL"
 echo "  RSA:   format=$RSA_CANDIDATE_FORMAT N=$RSA_POPULATION K=$RSA_K T=$RSA_STEPS"
+echo "  VLLM_CACHE_ROOT: \$VLLM_CACHE_ROOT"
+echo "  TORCHINDUCTOR_CACHE_DIR: \$TORCHINDUCTOR_CACHE_DIR"
 
 RSA_OUTPUT="$RSA_OUTPUT"
 RSA_MAX_EXAMPLES="$RSA_MAX_EXAMPLES"
