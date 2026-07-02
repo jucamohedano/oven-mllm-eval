@@ -19,6 +19,12 @@ Answer the image question with the most specific entity name. Return only the fi
 
 RSA_SYSTEM_PROMPT = "You are a careful visual problem solver for open-world image recognition."
 
+TRAVERSAL_SYSTEM_PROMPT = (
+    "You are a careful visual reasoner for open-world image recognition. "
+    "Your task is to identify the most specific entity in an image using "
+    "structured visual-semantic traversal."
+)
+
 GENERIC_OVEN_QUESTIONS = {
     "what is the main object?",
     "what is shown in the photo?",
@@ -62,6 +68,14 @@ def parse_args() -> argparse.Namespace:
         help="Number of cached candidate solution traces to include in aggregation prompts.",
     )
     parser.add_argument(
+        "--traversal-fraction",
+        type=float,
+        default=0.0,
+        help="Train-row probability of using a structured traversal prompt in rsa_trace mode. "
+        "When >0, rows not selected for traversal fall through to the standard/aggregation split. "
+        "Default 0.0 preserves existing behaviour.",
+    )
+    parser.add_argument(
         "--question-policy",
         choices=["aligned", "oven_original", "mixed", "dual"],
         default="aligned",
@@ -103,6 +117,8 @@ def parse_args() -> argparse.Namespace:
         raise SystemExit("--aggregation-k must be positive")
     if not 0 <= args.oven_question_fraction <= 1:
         raise SystemExit("--oven-question-fraction must be in [0, 1]")
+    if not 0 <= args.traversal_fraction <= 1:
+        raise SystemExit("--traversal-fraction must be in [0, 1]")
     if args.dataset_mode == "rsa_trace" and args.aggregation_fraction > 0 and not args.candidate_solutions:
         raise SystemExit("--dataset-mode rsa_trace with aggregation requires --candidate-solutions")
     return args
@@ -404,6 +420,58 @@ def build_rsa_aggregation_prompt(question: str, candidates: list[str]) -> list[d
     ]
 
 
+def build_rsa_traversal_prompt(question: str) -> list[dict[str, str]]:
+    """Build a structured traversal prompt that guides the model through taxonomy-aware search.
+
+    The model is asked to follow a fixed schema:
+      <visual_evidence>  → visible properties
+      <coarse_category>  → broad class
+      <candidates>       → candidate entities at increasing specificity
+      <traversal>        → taxonomy path: broader → finer → most specific
+      <decision>         → why the chosen entity fits the visual evidence
+      \\boxed{...}        → final answer
+    """
+    user_prompt = "\n".join(
+        [
+            "<image>",
+            "You are given an image and an open-world visual recognition question.",
+            "Follow this structured procedure to identify the most specific entity:",
+            "",
+            "<visual_evidence>",
+            "- List 2-4 concrete, directly visible properties of the object or entity in the image.",
+            "</visual_evidence>",
+            "",
+            "<coarse_category>",
+            "- Name the broad category the entity belongs to (e.g., animal, vehicle, building, food, tool, plant).",
+            "</coarse_category>",
+            "",
+            "<candidates>",
+            "- List 3-5 candidate entities at increasing specificity within that category.",
+            "</candidates>",
+            "",
+            "<traversal>",
+            "- Show the taxonomy path from broad class to the chosen entity:",
+            "  broader category → finer category → most specific entity.",
+            "</traversal>",
+            "",
+            "<decision>",
+            "- Explain which visual evidence distinguishes the chosen entity from the alternatives.",
+            "</decision>",
+            "",
+            r"End with the final answer in \boxed{}.",
+            "",
+            "Question:",
+            question.strip(),
+            "",
+            "Now follow the procedure step by step. End with the final answer in \\boxed{}.",
+        ]
+    )
+    return [
+        {"role": "system", "content": TRAVERSAL_SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
+    ]
+
+
 def choose_prompt_type(
     row: dict[str, Any],
     *,
@@ -415,6 +483,11 @@ def choose_prompt_type(
     if args.dataset_mode != "rsa_trace" or parquet_split != "train":
         return "standard" if args.dataset_mode == "rsa_trace" else "direct", [], [], ""
 
+    # Traversal roll first (opt-in via --traversal-fraction)
+    if args.traversal_fraction > 0 and rng.random() < args.traversal_fraction:
+        return "traversal", [], [], ""
+
+    # Remaining rows: standard vs aggregation (existing behaviour)
     row_id = str(row.get("data_id") or row.get("image_id") or "")
     candidates = candidates_by_id.get(row_id, [])
     if (
@@ -461,6 +534,9 @@ def make_record(
         answer_format = "plain"
     elif prompt_type == "aggregation":
         prompt = build_rsa_aggregation_prompt(question, candidate_solutions)
+        answer_format = "boxed"
+    elif prompt_type == "traversal":
+        prompt = build_rsa_traversal_prompt(question)
         answer_format = "boxed"
     else:
         prompt = build_rsa_standard_prompt(question)
@@ -758,6 +834,7 @@ def main() -> None:
         "include_label_only_evidence": args.include_label_only_evidence,
         "aggregation_fraction": args.aggregation_fraction if args.dataset_mode == "rsa_trace" else 0.0,
         "aggregation_k": args.aggregation_k if args.dataset_mode == "rsa_trace" else 0,
+        "traversal_fraction": args.traversal_fraction if args.dataset_mode == "rsa_trace" else 0.0,
         "candidate_solution_rows": len(candidates_by_id),
         "answer_format": "boxed" if args.dataset_mode == "rsa_trace" else "plain",
         "note": (
