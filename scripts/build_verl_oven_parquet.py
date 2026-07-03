@@ -10,6 +10,9 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import re
+import unicodedata
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +27,62 @@ TRAVERSAL_SYSTEM_PROMPT = (
     "Your task is to identify the most specific entity in an image using "
     "structured visual-semantic traversal."
 )
+
+# ---------------------------------------------------------------------------
+# 1-shot examples — use Eiffel Tower, a well-known entity with a real OVEN
+# taxonomy path (root → architectural element → perforated block → latticework →
+# lattice tower → Eiffel Tower).  The example teaches the format; the entity is
+# unlikely to appear in training data.
+# ---------------------------------------------------------------------------
+
+_ONESHOT_STANDARD = """\
+Here is an example of the expected format:
+Question: what type of vehicle is this?
+The image shows a four-wheeled motor vehicle with a enclosed cabin, four doors, and a rear liftgate. It has higher ground clearance than a sedan with roof rails and plastic body cladding around the wheel arches, which are characteristic of a crossover SUV designed for both urban and light off-road use.
+\\boxed{crossover SUV}
+
+Now answer the following problem with the same format:"""
+
+_ONESHOT_AGGREGATION = """\
+Here is an example of the expected format:
+Question: what type of vehicle is this?
+Candidate solutions:
+Solution 1: The four-door vehicle with a rear hatch is a family car. \\boxed{station wagon}
+Solution 2: The raised vehicle with roof rails and plastic cladding is a crossover SUV. \\boxed{crossover SUV}
+Solution 3: A four-wheel drive vehicle with high ground clearance for off-road use. \\boxed{off-road SUV}
+Solution 4: The vehicle with an enclosed cabin and liftgate, combining car-like handling with SUV styling and raised suspension. \\boxed{crossover SUV}
+
+The combination of raised ground clearance, roof rails, plastic wheel-arch cladding, and a rear liftgate on a car-based platform is characteristic of a crossover SUV. Solutions 2 and 4 correctly identify it, while Solution 1 misses the SUV features and Solution 3 describes a body-on-frame off-road vehicle.
+\\boxed{crossover SUV}
+
+Now answer the following problem with the same format. Check each candidate against the image:"""
+
+_ONESHOT_TRAVERSAL = """\
+Here is an example of the expected format:
+Question: what type of vehicle is this?
+<visual_evidence>
+- Four-wheeled motor vehicle with enclosed cabin and four doors
+- Rear liftgate, not a separate trunk
+- Higher ground clearance than a typical sedan
+- Roof rails and plastic cladding around wheel arches
+</visual_evidence>
+<coarse_category>
+vehicle
+</coarse_category>
+<candidates>
+1. crossover SUV
+2. station wagon
+3. off-road SUV
+</candidates>
+<traversal>
+entity → vehicle → car → sport utility vehicle → crossover SUV
+</traversal>
+<decision>
+The unibody construction with raised suspension, roof rails, and plastic cladding distinguishes a crossover SUV from a station wagon (lower, no cladding) and an off-road SUV (body-on-frame, higher clearance, typically no liftgate).
+</decision>
+\\boxed{crossover SUV}
+
+Now answer the following problem with the same format:"""
 
 GENERIC_OVEN_QUESTIONS = {
     "what is the main object?",
@@ -45,6 +104,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-root", help="Fallback image root if rows do not contain image_path.")
     parser.add_argument("--data-source", default="oven_taxonomy_reasoning")
     parser.add_argument("--ability", default="open_world_image_classification")
+    parser.add_argument(
+        "--standard-prompt-variant",
+        choices=["reasoning", "compute_buffer"],
+        default="reasoning",
+        help="Standard prompt style: 'reasoning' (default, 'Reason carefully...') or "
+        "'compute_buffer' ('Think step by step...'). Only affects rsa_trace standard rows.",
+    )
     parser.add_argument(
         "--dataset-mode",
         choices=["direct", "rsa_trace"],
@@ -374,20 +440,76 @@ def build_direct_prompt(question: str, evidence_lines: list[str]) -> list[dict[s
     ]
 
 
-def build_rsa_standard_prompt(question: str) -> list[dict[str, str]]:
-    user_prompt = "\n".join(
-        [
-            "<image>",
-            "You are given an image and an open-world visual recognition problem.",
-            "Write a concise solution that uses the image, the question, and relevant visual or world knowledge to identify the most specific entity name.",
-            r"Reason carefully and end with the final answer in \boxed{}.",
-            "",
-            "Problem:",
-            question.strip(),
-            "",
-            r"Now write a concise solution. End with the final answer in \boxed{}.",
-        ]
-    )
+def normalize_answer(text: str) -> str:
+    text = unicodedata.normalize("NFKC", text)
+    text = text.lower().strip()
+    text = text.replace("_", " ").replace("-", " ")
+    text = re.sub(r"\\[a-zA-Z]+\{([^{}]*)\}", r"\1", text)
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+@lru_cache(maxsize=1)
+def _load_alias_index() -> tuple[dict[str, set[str]], dict[str, str]]:
+    """Load alias maps from the taxonomy index (cached)."""
+    import os
+    path = os.environ.get("OVEN_TAXONOMY_INDEX", "data/processed/oven_taxonomy_index.json")
+    index_path = Path(path)
+    if not index_path.exists():
+        return {}, {}
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    aliases_by_canonical: dict[str, set[str]] = {}
+    canonical_by_alias: dict[str, str] = {}
+    for alias, canonical in index.get("aliases", {}).items():
+        alias_norm = normalize_answer(str(alias))
+        canonical_norm = normalize_answer(str(canonical))
+        if not alias_norm or not canonical_norm:
+            continue
+        aliases_by_canonical.setdefault(canonical_norm, set()).add(alias_norm)
+        canonical_by_alias.setdefault(alias_norm, canonical_norm)
+    return aliases_by_canonical, canonical_by_alias
+
+
+_ONESHOT_STANDARD_COMPUTE_BUFFER = """\
+Here is an example of the expected format:
+Question: what type of vehicle is this?
+Let me think: the image shows a four-wheeled motor vehicle with an enclosed cabin, four doors, and a rear liftgate. It has higher ground clearance than a sedan, with roof rails and plastic body cladding around the wheel arches. These features point to a crossover SUV — built on a car platform but with SUV styling and raised suspension.
+\\boxed{crossover SUV}
+
+Now answer the following problem with the same format:"""
+
+
+def build_rsa_standard_prompt(question: str, prompt_variant: str = "reasoning") -> list[dict[str, str]]:
+    if prompt_variant == "compute_buffer":
+        oneshot = _ONESHOT_STANDARD_COMPUTE_BUFFER
+        user_prompt = "\n".join(
+            [
+                "<image>",
+                "Think step by step about what you see. Then give the most specific entity name in \\boxed{}.",
+                "",
+                oneshot,
+                "Problem:",
+                question.strip(),
+                "",
+                "Think step by step. End with the final answer in \\boxed{}.",
+            ]
+        )
+    else:
+        oneshot = _ONESHOT_STANDARD
+        user_prompt = "\n".join(
+            [
+                "<image>",
+                "You are given an image and an open-world visual recognition problem.",
+                "Write a concise solution that uses the image, the question, and relevant visual or world knowledge to identify the most specific entity name.",
+                r"Reason carefully and end with the final answer in \boxed{}.",
+                "",
+                oneshot,
+                "Problem:",
+                question.strip(),
+                "",
+                r"Now write a concise solution. End with the final answer in \boxed{}.",
+            ]
+        )
     return [
         {"role": "system", "content": RSA_SYSTEM_PROMPT},
         {"role": "user", "content": user_prompt},
@@ -405,6 +527,7 @@ def build_rsa_aggregation_prompt(question: str, candidates: list[str]) -> list[d
             "Your task is to synthesize the most reliable answer by checking the candidates against the image and the question.",
             r"Write a concise improved solution and end with the final answer in \boxed{}.",
             "",
+            _ONESHOT_AGGREGATION,
             "Problem:",
             question.strip(),
             "",
@@ -460,6 +583,7 @@ def build_rsa_traversal_prompt(question: str) -> list[dict[str, str]]:
             "",
             r"End with the final answer in \boxed{}.",
             "",
+            _ONESHOT_TRAVERSAL,
             "Question:",
             question.strip(),
             "",
@@ -470,6 +594,38 @@ def build_rsa_traversal_prompt(question: str) -> list[dict[str, str]]:
         {"role": "system", "content": TRAVERSAL_SYSTEM_PROMPT},
         {"role": "user", "content": user_prompt},
     ]
+
+
+def _candidate_correct(candidate_text: str, valid_answer_norms: set[str]) -> bool:
+    """Check whether a candidate solution's boxed answer matches the ground truth."""
+    boxed, parsed = extract_boxed_answer(str(candidate_text))
+    if not parsed:
+        return False
+    return normalize_answer(boxed) in valid_answer_norms
+
+
+def _build_valid_answer_norms(row: dict[str, Any]) -> set[str]:
+    """Build a set of valid normalized answers for a row (mirrors oven_boxed.py)."""
+    aliases_by_canonical, canonical_by_alias = _load_alias_index()
+    labels = row.get("taxonomy_labels") or []
+    leaf = str(labels[0]) if labels else ""
+
+    answers = {
+        normalize_answer(str(v))
+        for v in (row.get("answer", ""), row.get("entity_text", ""), leaf)
+        if str(v).strip()
+    }
+    answers.discard("")
+
+    expanded = set(answers)
+    for ans in list(answers):
+        canonical = canonical_by_alias.get(ans)
+        if canonical:
+            expanded.add(canonical)
+    for ans in list(expanded):
+        expanded.update(aliases_by_canonical.get(ans, set()))
+    expanded.discard("")
+    return expanded
 
 
 def choose_prompt_type(
@@ -487,7 +643,7 @@ def choose_prompt_type(
     if args.traversal_fraction > 0 and rng.random() < args.traversal_fraction:
         return "traversal", [], [], ""
 
-    # Remaining rows: standard vs aggregation (existing behaviour)
+    # Remaining rows: standard vs aggregation with controlled difficulty
     row_id = str(row.get("data_id") or row.get("image_id") or "")
     candidates = candidates_by_id.get(row_id, [])
     if (
@@ -496,9 +652,28 @@ def choose_prompt_type(
         and args.aggregation_fraction > 0
         and rng.random() < args.aggregation_fraction
     ):
-        indices = rng.sample(range(len(candidates)), args.aggregation_k)
-        selected = [candidates[index] for index in indices]
-        return "aggregation", selected, indices, "candidate_solutions"
+        # Classify each candidate as correct/wrong
+        valid = _build_valid_answer_norms(row)
+        correct_idxs = [i for i, c in enumerate(candidates)
+                        if _candidate_correct(c, valid)]
+        wrong_idxs = [i for i, c in enumerate(candidates)
+                      if not _candidate_correct(c, valid)]
+
+        # Only emit aggregation if we can construct a set with 1-2 correct
+        target_correct = rng.choice([1, 2])
+        n_available_correct = min(target_correct, len(correct_idxs))
+        n_needed_wrong = args.aggregation_k - n_available_correct
+
+        if n_available_correct >= 1 and len(wrong_idxs) >= n_needed_wrong:
+            chosen = (
+                rng.sample(correct_idxs, n_available_correct)
+                + rng.sample(wrong_idxs, n_needed_wrong)
+            )
+            rng.shuffle(chosen)
+            selected = [candidates[i] for i in chosen]
+            return "aggregation", selected, chosen, "candidate_solutions"
+        # else: fall through to standard (not enough correct or wrong to build a balanced set)
+
     return "standard", [], [], ""
 
 
@@ -539,7 +714,7 @@ def make_record(
         prompt = build_rsa_traversal_prompt(question)
         answer_format = "boxed"
     else:
-        prompt = build_rsa_standard_prompt(question)
+        prompt = build_rsa_standard_prompt(question, prompt_variant=args.standard_prompt_variant)
         answer_format = "boxed"
 
     candidate_final_answers = [extract_boxed_answer(candidate)[0] for candidate in candidate_solutions]
@@ -835,6 +1010,7 @@ def main() -> None:
         "aggregation_fraction": args.aggregation_fraction if args.dataset_mode == "rsa_trace" else 0.0,
         "aggregation_k": args.aggregation_k if args.dataset_mode == "rsa_trace" else 0,
         "traversal_fraction": args.traversal_fraction if args.dataset_mode == "rsa_trace" else 0.0,
+        "standard_prompt_variant": args.standard_prompt_variant if args.dataset_mode == "rsa_trace" else "reasoning",
         "candidate_solution_rows": len(candidates_by_id),
         "answer_format": "boxed" if args.dataset_mode == "rsa_trace" else "plain",
         "note": (
