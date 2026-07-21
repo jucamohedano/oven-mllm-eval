@@ -29,17 +29,13 @@ Slurm options:
 
 Inference options:
     --model <MODEL>               Model path or HF ID (default: Qwen/Qwen3-VL-8B-Instruct)
-    --method <METHOD>             Sampling method: naive, naive-sampling, iterative (default: naive)
+    --method <METHOD>             Sampling method: naive, naive-sampling (default: naive)
     --prompt <VARIANT>           Prompt variant: barebones, default, specific, vague (default: barebones)
     --temperature <TEMP>          Sampling temperature (default: 1.0)
     --top-p <P>                   Nucleus sampling threshold (default: 1.0)
     --top-k <K>                   Top-k sampling (default: -1 = disabled)
     --max-tokens <TOKENS>         Max tokens per sample (default: 300)
     --samples-per-example <N>     Samples per example for naive-sampling (default: 64)
-    --attempts-per-round <N>      Attempts per round for iterative (default: 16)
-    --max-rounds <T>              Max rounds for iterative (default: 1)
-    --feedback <BOOL>             Enable feedback for iterative: true/false (default: false)
-    --max-feedback-chars <N>      Max chars for feedback messages (default: 2000)
 
 Scoring options:
     --judge-model <MODEL>         Text-only judge model (default: none). When set, runs a
@@ -127,10 +123,6 @@ INF_TOP_P="1.0"
 INF_TOP_K="-1"
 INF_MAX_TOKENS="300"
 INF_SAMPLES_PER_EXAMPLE="64"
-INF_ATTEMPTS_PER_ROUND="16"
-INF_MAX_ROUNDS="1"
-INF_FEEDBACK="false"
-INF_MAX_FEEDBACK_CHARS="2000"
 
 # Data
 INF_INPUT="data/processed/vlm_compatible_val.jsonl"
@@ -204,10 +196,6 @@ main() {
             --top-k)           INF_TOP_K="$2"; shift 2 ;;
             --max-tokens)      INF_MAX_TOKENS="$2"; shift 2 ;;
             --samples-per-example) INF_SAMPLES_PER_EXAMPLE="$2"; shift 2 ;;
-            --attempts-per-round) INF_ATTEMPTS_PER_ROUND="$2"; shift 2 ;;
-            --max-rounds)      INF_MAX_ROUNDS="$2"; shift 2 ;;
-            --feedback)        INF_FEEDBACK="$2"; shift 2 ;;
-            --max-feedback-chars) INF_MAX_FEEDBACK_CHARS="$2"; shift 2 ;;
             --input)           INF_INPUT="$2"; shift 2 ;;
             --taxonomy-index)  INF_TAXONOMY_INDEX="$2"; shift 2 ;;
             --max-examples)    INF_MAX_EXAMPLES="$2"; shift 2 ;;
@@ -328,8 +316,6 @@ main() {
     case "$INF_METHOD" in
         naive-sampling)
             METHOD_FLAGS="--samples-per-example $INF_SAMPLES_PER_EXAMPLE" ;;
-        iterative)
-            METHOD_FLAGS="--attempts-per-round $INF_ATTEMPTS_PER_ROUND --max-rounds $INF_MAX_ROUNDS --enable-feedback $INF_FEEDBACK --max-feedback-chars $INF_MAX_FEEDBACK_CHARS" ;;
     esac
 
     # Pre-flight: venv must already be built
@@ -849,7 +835,6 @@ if [[ "$INF_DP" -gt 1 ]]; then
                 $NO_IMAGE_FLAG \\
                 $PREFETCH_IMAGES_FLAG \\
                 \$([ "$INF_METHOD" = "naive-sampling" ] && echo "--samples-per-example $INF_SAMPLES_PER_EXAMPLE") \\
-                \$([ "$INF_METHOD" = "iterative" ] && echo "--attempts-per-round $INF_ATTEMPTS_PER_ROUND --max-rounds $INF_MAX_ROUNDS --enable-feedback $INF_FEEDBACK --max-feedback-chars $INF_MAX_FEEDBACK_CHARS") \\
                 $MAX_EXAMPLES_FLAG \\
                 --resume \\
                 --restart-every $INF_RESTART_EVERY \\
@@ -944,7 +929,6 @@ else
             $NO_IMAGE_FLAG \\
             $PREFETCH_IMAGES_FLAG \\
             \$([ "$INF_METHOD" = "naive-sampling" ] && echo "--samples-per-example $INF_SAMPLES_PER_EXAMPLE") \\
-            \$([ "$INF_METHOD" = "iterative" ] && echo "--attempts-per-round $INF_ATTEMPTS_PER_ROUND --max-rounds $INF_MAX_ROUNDS --enable-feedback $INF_FEEDBACK --max-feedback-chars $INF_MAX_FEEDBACK_CHARS") \\
             $MAX_EXAMPLES_FLAG \\
             --resume \\
             --restart-every $INF_RESTART_EVERY 2>> "\${OUTPUT_DIR}/engine_debug.log" || rc=\$?

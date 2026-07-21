@@ -147,7 +147,7 @@ ______________________________________________________________________
 
 | Script | Purpose |
 | ------ | ------- |
-| `scripts/run_inference.py` | vLLM rollouts (`naive`, `naive-sampling`, `iterative`) |
+| `scripts/run_inference.py` | vLLM rollouts (`naive`, `naive-sampling`) |
 | `scripts/run_judge.py` | LM-as-judge verdict per rollout |
 | `scripts/score_predictions.py` | Taxonomy mapping, hP/hR/hF, pass@k |
 | `scripts/run_recursive_self_agg.py` | Recursive self-aggregation over a rollout population |
