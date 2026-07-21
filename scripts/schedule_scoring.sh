@@ -53,6 +53,10 @@ Judge options:
     --judge-top-k <K>             Judge top-k — free-form only, -1=disabled (default: -1)
     --judge-with-desc             Add available ground-truth/parent/grandparent
                                   description evidence to free-form judge prompts.
+    --judge-only                  Run judge + judge/pass@k summary only; skip taxonomy
+                                  scoring. Requires --judge-model.
+    --merge-judge-into-scored     In --judge-only mode, also merge judge_* fields into
+                                  --output. Default: leave scored JSONL untouched.
     --label-chains <PATH>         Optional label chain override. By default, judge
                                   evidence uses --taxonomy-index, same as scoring.
     --desc-chains <PATH>          Description chains JSONL
@@ -62,6 +66,9 @@ Scoring options:
     --input <PATH>                Input samples JSONL (required)
     --output <PATH>               Per-example scored JSONL output
                                   (default: <input_dir>/<run_id>_scored.jsonl)
+    --base-summary <PATH>         Existing taxonomy results JSON to use as the base
+                                  for --judge-only per-judge summaries. If omitted,
+                                  inferred from --output when possible.
     --taxonomy-index <PATH>       Taxonomy index JSON
                                   (default: data/processed/oven_taxonomy_index.json)
     --measure <MEASURE> [...]     Measure(s): exact_match, contained, all
@@ -82,6 +89,7 @@ while [ "$(find . -maxdepth 1 -name pyproject.toml | wc -l)" -ne 1 ]; do cd ..; 
 SLURM_PARTITION="boost_usr_prod"
 SLURM_ACCOUNT=""
 SLURM_CPUS="4"
+SLURM_CPUS_SET="0"
 SLURM_MEM="30G"
 SLURM_TIME="04:00:00"
 SLURM_NAME="oven-score"
@@ -100,6 +108,8 @@ INF_JUDGE_TOP_K="-1"
 INF_JUDGE_OUTPUT=""     # override judge output path (default: auto-derived)
 INF_JUDGE_WITH_DESC="0"
 INF_JUDGE_VENV=""          # override venv to source on compute node (auto if empty)
+INF_JUDGE_ONLY="0"
+INF_MERGE_JUDGE_INTO_SCORED="0"
 INF_LABEL_CHAINS=""
 INF_DESC_CHAINS="data/raw/oven_wikidata_chains_cleaned_descs.jsonl"
 
@@ -107,6 +117,7 @@ INF_DESC_CHAINS="data/raw/oven_wikidata_chains_cleaned_descs.jsonl"
 SCORING_INPUT=""
 SCORING_OUTPUT=""
 SCORING_SUMMARY=""        # aggregate results JSON (empty = auto-derive)
+SCORING_BASE_SUMMARY=""   # existing taxonomy results JSON for judge-only summary composition
 SCORING_TAXONOMY_INDEX="data/processed/oven_taxonomy_index.json"
 SCORING_MEASURE="exact_match"
 SCORING_NUM_WORKERS="0"
@@ -126,13 +137,14 @@ main() {
         case $1 in
             -p|--partition)    SLURM_PARTITION="$2"; shift 2 ;;
             -A|--account)      SLURM_ACCOUNT="$2"; shift 2 ;;
-            -c|--cpus)         SLURM_CPUS="$2"; shift 2 ;;
+            -c|--cpus)         SLURM_CPUS="$2"; SLURM_CPUS_SET="1"; shift 2 ;;
             -m|--mem)          SLURM_MEM="$2"; shift 2 ;;
             -t|--time)         SLURM_TIME="$2"; shift 2 ;;
             -n|--name)         SLURM_NAME="$2"; shift 2 ;;
             --input)           SCORING_INPUT="$2"; shift 2 ;;
             --output)          SCORING_OUTPUT="$2"; shift 2 ;;
             --summary)         SCORING_SUMMARY="$2"; shift 2 ;;
+            --base-summary)    SCORING_BASE_SUMMARY="$2"; shift 2 ;;
             --taxonomy-index)  SCORING_TAXONOMY_INDEX="$2"; shift 2 ;;
             --measure)         SCORING_MEASURE="$2"; shift 2 ;;
             --num-workers)     SCORING_NUM_WORKERS="$2"; shift 2 ;;
@@ -150,6 +162,8 @@ main() {
             --judge-top-k)      INF_JUDGE_TOP_K="$2"; shift 2 ;;
             --judge-output)     INF_JUDGE_OUTPUT="$2"; shift 2 ;;
             --judge-with-desc)  INF_JUDGE_WITH_DESC="1"; shift ;;
+            --judge-only)       INF_JUDGE_ONLY="1"; shift ;;
+            --merge-judge-into-scored) INF_MERGE_JUDGE_INTO_SCORED="1"; shift ;;
             --judge-venv)       INF_JUDGE_VENV="$2"; shift 2 ;;
             --label-chains)     INF_LABEL_CHAINS="$2"; shift 2 ;;
             --desc-chains)      INF_DESC_CHAINS="$2"; shift 2 ;;
@@ -174,6 +188,10 @@ main() {
     fi
     if [[ "$INF_JUDGE_WITH_DESC" == "1" && "$INF_JUDGE_MODE" != "free-form" ]]; then
         echo "[error] --judge-with-desc requires --judge-mode free-form" >&2
+        exit 1
+    fi
+    if [[ "$INF_JUDGE_ONLY" == "1" && -z "$INF_JUDGE_MODEL" ]]; then
+        echo "[error] --judge-only requires --judge-model" >&2
         exit 1
     fi
 
@@ -202,10 +220,25 @@ main() {
         fi
     fi
 
+    if [[ "$INF_JUDGE_ONLY" == "1" && -z "$SCORING_BASE_SUMMARY" && -n "$SCORING_OUTPUT" ]]; then
+        _out_dir="$(dirname "$SCORING_OUTPUT")"
+        _out_base="$(basename "$SCORING_OUTPUT" .jsonl)"
+        if [[ "$_out_base" == *_samples_scored_* ]]; then
+            _prefix="${_out_base%%_samples_scored_*}"
+            _suffix="${_out_base#*_samples_scored_}"
+            _candidate="${_out_dir}/${_prefix}_results_${_suffix}.json"
+            if [[ -f "$_candidate" ]]; then
+                SCORING_BASE_SUMMARY="$_candidate"
+            fi
+        fi
+    fi
+
     # Judge defaults
     if [[ -n "$INF_JUDGE_MODEL" ]]; then
         SLURM_NAME="${SLURM_NAME}-judge"
-        SLURM_CPUS="8"
+        if [[ "$SLURM_CPUS_SET" == "0" ]]; then
+            SLURM_CPUS="8"
+        fi
         # Only upgrade mem if user didn't set it explicitly (default is 30G).
         if [[ "$SLURM_MEM" == "30G" ]]; then
             SLURM_MEM="64G"
@@ -214,9 +247,17 @@ main() {
         # failing test (when GPUS=1) makes the command-sub return non-zero,
         # which aborts the assignment and kills the script before submit.
         if [[ "$INF_JUDGE_GPUS" -gt 1 ]]; then
-            JOB_TYPE="$INF_JUDGE_GPUS GPUs (judge + score)"
+            if [[ "$INF_JUDGE_ONLY" == "1" ]]; then
+                JOB_TYPE="$INF_JUDGE_GPUS GPUs (judge only)"
+            else
+                JOB_TYPE="$INF_JUDGE_GPUS GPUs (judge + score)"
+            fi
         else
-            JOB_TYPE="1 GPU (judge + score)"
+            if [[ "$INF_JUDGE_ONLY" == "1" ]]; then
+                JOB_TYPE="1 GPU (judge only)"
+            else
+                JOB_TYPE="1 GPU (judge + score)"
+            fi
         fi
     else
         JOB_TYPE="CPU-only (score)"
@@ -258,6 +299,9 @@ main() {
     echo "  Output:       $SCORING_OUTPUT"
     echo "  Measure:      $SCORING_MEASURE"
     echo "  Workers:      $SCORING_NUM_WORKERS"
+    if [[ "$INF_JUDGE_ONLY" == "1" && -n "$SCORING_BASE_SUMMARY" ]]; then
+        echo "  Base summary: $SCORING_BASE_SUMMARY"
+    fi
     echo "  Venv:         $JUDGE_VENV"
     echo "  Modules:      $JUDGE_MODULE_CMD"
     if [[ -n "$INF_JUDGE_MODEL" ]]; then
@@ -320,6 +364,7 @@ export OVEN_NODE_EMB_DIR="${OVEN_NODE_EMB_DIR:-/leonardo_work/EUHPC_D33_243/oven
 echo "[info] \$SLURM_JOB_ID on \$(hostname)"
 echo "  Input:    $SCORING_INPUT"
 echo "  Output:   $SCORING_OUTPUT"
+echo "  Judge only: $INF_JUDGE_ONLY"
 
 SAMPLES="$SCORING_INPUT"
 if [[ "$INF_JUDGE_WITH_DESC" == "1" ]]; then
@@ -389,6 +434,48 @@ if [[ -n "$INF_JUDGE_MODEL" ]]; then
         fi
     fi
     SAMPLES="\$JUDGED"
+
+    if [[ "$INF_JUDGE_ONLY" == "1" ]]; then
+        echo "[info] Judge-only mode: skipping taxonomy scoring."
+        JUDGE_RESULTS_ARGS=(--judged "\$JUDGED")
+        if [[ -n "$SCORING_SUMMARY" ]]; then
+            JUDGE_RESULTS_ARGS+=(--output "$SCORING_SUMMARY")
+        fi
+        if [[ -n "$SCORING_BASE_SUMMARY" ]]; then
+            JUDGE_RESULTS_ARGS+=(--base-summary "$SCORING_BASE_SUMMARY")
+        fi
+        python -m scripts.judge_to_results "\${JUDGE_RESULTS_ARGS[@]}"
+
+        if [[ "$INF_MERGE_JUDGE_INTO_SCORED" == "1" ]]; then
+            if [[ -s "$SCORING_OUTPUT" ]]; then
+                echo "[info] Merging judge fields into existing scored file: $SCORING_OUTPUT"
+                python -m scripts.merge_judge_into_scored \\
+                    --judged "\$JUDGED" \\
+                    --scored "$SCORING_OUTPUT"
+            else
+                echo "[warning] --merge-judge-into-scored requested, but scored file not found: $SCORING_OUTPUT"
+            fi
+        else
+            echo "[info] Leaving scored JSONL unchanged. Use --merge-judge-into-scored to add judge_* fields."
+        fi
+
+        mapfile -t shards < <(compgen -G "\${JUDGED}_shard*.jsonl" | sort || true)
+        if [[ \${#shards[@]} -gt 0 && -s "\$JUDGED" ]]; then
+            echo "[cleanup] checking intermediate judge shard files..."
+            _judge_shard_total=\$(cat "\${shards[@]}" 2>/dev/null | wc -l)
+            _judge_total=\$(wc -l < "\$JUDGED" 2>/dev/null || echo 0)
+            if [[ "\${_judge_shard_total}" -eq "\${_judge_total}" ]]; then
+                echo "[cleanup] removing intermediate judge shard files..."
+                rm -f "\${shards[@]}"
+                echo "[cleanup] removed intermediate judge shard files"
+            else
+                echo "[cleanup] SKIPPED — judge shard/merge mismatch "\
+                     "(\${_judge_shard_total} shard vs \${_judge_total} merged)"
+            fi
+        fi
+        echo "[info] Done. Judged output: \$JUDGED"
+        exit 0
+    fi
 fi
 
 echo "[info] Scoring \$SAMPLES..."

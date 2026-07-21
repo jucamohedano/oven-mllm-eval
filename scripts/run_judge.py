@@ -35,36 +35,7 @@ from oven_mllm_eval.judge import (
     JudgeParseError,
 )
 from oven_mllm_eval.paths import OVEN_TAXONOMY_INDEX, out_descs
-
-
-def load_taxonomy_chains(path: str | Path) -> dict[str, list[str]]:
-    """Load taxonomy chains keyed by entity QID."""
-    chains: dict[str, list[str]] = {}
-    with open(path, "r") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            row = json.loads(line)
-            qid = row.get("id")
-            taxonomy = row.get("taxonomy", [])
-            if qid and isinstance(taxonomy, list):
-                chains[qid] = [str(item) for item in taxonomy]
-    return chains
-
-
-def load_label_chains_from_index(path: str | Path) -> dict[str, list[str]]:
-    """Load entity leaf-to-root label chains from the precomputed taxonomy index."""
-    index = json.loads(Path(path).read_text())
-    chains = {}
-    for qid, path_labels in index.get("entity_id_to_path", {}).items():
-        if not isinstance(path_labels, list):
-            continue
-        labels = [str(label) for label in path_labels]
-        if labels and labels[-1] == "root":
-            labels = labels[:-1]
-        chains[qid] = labels
-    return chains
+from oven_mllm_eval.taxonomy_io import load_label_chains_from_index, load_taxonomy_chains
 
 
 def main():
@@ -318,7 +289,6 @@ def main():
         now_str = datetime.now().strftime("%H:%M:%S")
         print(f"{now_str}  [chunk {ci + 1}/{n_chunks}] examples {s}–{e - 1}"
               + f" ({len(chunk)} remaining)")
-
         # ── Dedup: build unique prompts ─────────────────────────────
         # Naive-sampling produces many byte-identical rollouts for short
         # entity answers.  Judge each unique prompt once, then fan the
