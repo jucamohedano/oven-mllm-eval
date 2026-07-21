@@ -51,6 +51,7 @@ from vllm import LLM, SamplingParams
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from oven_mllm_eval.io import append_jsonl, write_jsonl
+from oven_mllm_eval.images import load_pil, resolve_image_path, load_images
 from oven_mllm_eval.prompts import get_prompt, PROMPT_VARIANTS
 
 
@@ -115,58 +116,8 @@ def _build_feedback(round_idx: int, failed_texts: list[str], max_chars: int = 20
 
 
 # ---------------------------------------------------------------------------
-# Image loading
+# Image loading — see src/oven_mllm_eval/images.py (shared with the judge)
 # ---------------------------------------------------------------------------
-
-def _load_pil(path: str) -> Image.Image:
-    """Load an image as RGB PIL, raising on missing or unreadable files."""
-    if not path:
-        raise ValueError("Empty image_path in example")
-    p = Path(path)
-    if not p.exists():
-        for ext in (".JPEG", ".jpeg", ".JPG"):
-            alt = p.with_suffix(ext)
-            if alt.exists():
-                p = alt
-                break
-        else:
-            raise FileNotFoundError(f"Image not found: {p.resolve()} (cwd={Path.cwd()})")
-    img = Image.open(p)
-    if img.mode not in ("RGB", "L"):
-        img = img.convert("RGB")
-    return img
-
-
-def _resolve_image_path(path: str, root: Path) -> str:
-    """Resolve a (possibly relative) image path and verify it exists.
-
-    Cheap preflight (stat only, no decode) so a missing file fails the run
-    immediately instead of at chunk N.  Returns the resolved path string.
-    """
-    if not path:
-        raise ValueError("Empty image_path in example")
-    p = Path(path) if Path(path).is_absolute() else root / path
-    if not p.exists():
-        for ext in (".JPEG", ".jpeg", ".JPG"):
-            alt = p.with_suffix(ext)
-            if alt.exists():
-                return str(alt)
-        raise FileNotFoundError(f"Image not found: {p.resolve()} (cwd={Path.cwd()})")
-    return str(p)
-
-
-def _load_images(paths: list[str], max_workers: int = 16) -> list[Image.Image]:
-    """Decode a batch of images in parallel.
-
-    Called per chunk (NOT upfront for the whole dataset): PIL pixel buffers
-    for 60k+ images would otherwise accumulate in host RAM as vLLM touches
-    them, growing RSS monotonically until the SLURM cgroup OOM-kills the
-    engine core process.  Loading per chunk keeps the working set to one
-    chunk and lets the GC reclaim it after each llm.chat() call.
-    """
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        return list(pool.map(_load_pil, paths))
-
 
 # ---------------------------------------------------------------------------
 # Prompt builders
@@ -544,7 +495,7 @@ def main():
         print(f"Resolving image paths... (root: {image_root})")
         with ThreadPoolExecutor(max_workers=16) as pool:
             resolved_paths = list(pool.map(
-                lambda p: _resolve_image_path(p, image_root),
+                lambda p: resolve_image_path(p, image_root),
                 [e.get("image_path", "") for e in examples],
             ))
 
@@ -678,7 +629,7 @@ def main():
             s = ci * args.chunk_size
             e = min(s + args.chunk_size, len(examples))
             print(f"[chunk {ci + 1}/{n_chunks}] examples {s}–{e - 1}")
-            chunk_images = [None] * (e - s) if args.no_image else _load_images(
+            chunk_images = [None] * (e - s) if args.no_image else load_images(
                 resolved_paths[s:e],
                 args.image_workers,
             )
@@ -702,7 +653,7 @@ def main():
             prefetch_pool = ThreadPoolExecutor(max_workers=1)
             first_end = min(args.chunk_size, len(examples))
             next_images_future = prefetch_pool.submit(
-                _load_images,
+                load_images,
                 resolved_paths[:first_end],
                 args.image_workers,
             )
@@ -732,13 +683,13 @@ def main():
                     chunk_images = next_images_future.result()
                     next_images_future = None
                 else:
-                    chunk_images = _load_images(resolved_paths[s:e], args.image_workers)
+                    chunk_images = load_images(resolved_paths[s:e], args.image_workers)
                 load_seconds = time.perf_counter() - load_start
 
                 if prefetch_enabled and prefetch_pool is not None and e < len(examples):
                     next_e = min(e + args.chunk_size, len(examples))
                     next_images_future = prefetch_pool.submit(
-                        _load_images,
+                        load_images,
                         resolved_paths[e:next_e],
                         args.image_workers,
                     )
