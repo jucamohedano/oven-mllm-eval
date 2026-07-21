@@ -29,11 +29,14 @@ analysis = [
     "seaborn>=0.13",
     "pyvis>=0.3",
 ]
-# For semantic (cosine) taxonomy mapping — the 'cascade' measure (sentence-bert retrieval).
+# For semantic taxonomy mapping and direct text measures.
 # Install with:  uv sync --extra embed
-# Then download the model:  hf download sentence-transformers/all-mpnet-base-v2
 embed = [
     "sentence-transformers>=3.0",
+    "open_clip_torch>=2.26",
+    "evaluate>=0.4",
+    "nltk>=3.8",
+    "rouge_score>=0.1.2",
     "numpy>=1.26",
 ]
 dev = [

@@ -148,18 +148,63 @@ def _global_done_ids(base_output: Path) -> set[str]:
     return done
 
 
-def _resolve_image_path(path: str, root: Path) -> str:
-    """Resolve image paths like ``scripts/run_inference.py`` does."""
-    if not path:
-        raise ValueError("Empty image_path in example")
-    p = Path(path) if Path(path).is_absolute() else root / path
-    if not p.exists():
-        for ext in (".JPEG", ".jpeg", ".JPG"):
-            alt = p.with_suffix(ext)
-            if alt.exists():
-                return str(alt)
-        raise FileNotFoundError(f"Image not found: {p.resolve()} (cwd={Path.cwd()})")
-    return str(p)
+def _path_variants(path: Path) -> list[Path]:
+    variants = [path]
+    for ext in (".jpg", ".jpeg", ".JPEG", ".JPG", ".png", ".PNG", ".webp", ".WEBP"):
+        if path.suffix != ext:
+            variants.append(path.with_suffix(ext))
+    return variants
+
+
+def _resolve_image_path(row: dict[str, Any], root: Path) -> str:
+    """Resolve image paths, including stale absolute paths from prepared JSONL.
+
+    Some prepared OVEN rows contain absolute paths under the old image root
+    while the cluster stores files under ``<root>/data/images``.  Prefer the
+    stored path when valid, then fall back to root/basename and image_id names.
+    """
+    raw_path = str(row.get("image_path") or "")
+    image_id = str(row.get("image_id") or "")
+    if not raw_path and not image_id:
+        raise ValueError(f"Empty image_path and image_id in example: {_row_id(row)}")
+
+    candidates: list[Path] = []
+    if raw_path:
+        path = Path(raw_path)
+        candidates.append(path if path.is_absolute() else root / path)
+        candidates.append(path)
+        names = [path.name]
+    else:
+        names = []
+
+    if image_id:
+        names.append(f"{image_id}.jpg")
+
+    search_roots = [root, root / "data" / "images", root / "images"]
+    for search_root in search_roots:
+        for name in names:
+            if name:
+                candidates.append(search_root / name)
+
+    tried: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        for variant in _path_variants(candidate):
+            key = str(variant)
+            if key in seen:
+                continue
+            seen.add(key)
+            tried.append(key)
+            if variant.exists():
+                return str(variant)
+
+    preview = ", ".join(tried[:8])
+    if len(tried) > 8:
+        preview += ", ..."
+    raise FileNotFoundError(
+        f"Image not found for data_id={row.get('data_id')} image_id={image_id}; "
+        f"tried: {preview} (cwd={Path.cwd()})"
+    )
 
 
 def _load_pil(path: str) -> Image.Image:
@@ -210,8 +255,22 @@ def _sample_subsets(
     return [rng.sample(population, k_eff) for _ in range(n_subsets)]
 
 
+def _strip_latex_answer(answer: str) -> str:
+    answer = answer.strip().strip("$").strip().strip(".").strip()
+    wrappers = (r"\text", r"\mathrm", r"\operatorname", r"\mathbf")
+    changed = True
+    while changed:
+        changed = False
+        for wrapper in wrappers:
+            prefix = wrapper + "{"
+            if answer.startswith(prefix) and answer.endswith("}"):
+                answer = answer[len(prefix):-1].strip()
+                changed = True
+    return answer.strip().strip("$").strip().strip(".").strip()
+
+
 def extract_boxed_answer(text: str) -> tuple[str, bool]:
-    """Extract the last ``\boxed{...}`` answer from a solution trace."""
+    """Extract the last ``\boxed{...}`` answer, supporting nested braces."""
     matches = []
     start = 0
     needle = r"\boxed{"
@@ -220,15 +279,24 @@ def extract_boxed_answer(text: str) -> tuple[str, bool]:
         if box_start < 0:
             break
         content_start = box_start + len(needle)
-        content_end = text.find("}", content_start)
-        if content_end < 0:
+        depth = 1
+        idx = content_start
+        while idx < len(text) and depth > 0:
+            char = text[idx]
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+            idx += 1
+        if depth == 0:
+            answer = _strip_latex_answer(text[content_start:idx - 1])
+            if answer:
+                matches.append(answer)
+            start = idx
+        else:
             break
-        answer = text[content_start:content_end].strip()
-        if answer:
-            matches.append(answer)
-        start = content_end + 1
     if matches:
-        return matches[-1].strip().strip(".").strip(), True
+        return matches[-1], True
     return text.strip(), False
 
 
@@ -700,8 +768,8 @@ def main() -> None:
         print(f"Resolving image paths... (root: {image_root})")
         with ThreadPoolExecutor(max_workers=16) as pool:
             resolved_paths = list(pool.map(
-                lambda path: _resolve_image_path(path, image_root),
-                [row.get("image_path", "") for row in rows],
+                lambda row: _resolve_image_path(row, image_root),
+                rows,
             ))
 
     print(f"Initializing vLLM engine: model={args.model} tp={args.tp}")

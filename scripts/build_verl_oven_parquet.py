@@ -20,12 +20,34 @@ from typing import Any
 DIRECT_SYSTEM_PROMPT = """You are a vision-language model for open-world image classification.
 Answer the image question with the most specific entity name. Return only the final answer."""
 
-RSA_SYSTEM_PROMPT = "You are a careful visual problem solver for open-world image recognition."
+RSA_SYSTEM_PROMPT = (
+    "You are a visual entity recognition expert. "
+    "Your task is to identify the most specific Wikidata entity in an image. "
+    "For each problem, you will be given an image, a question, and several "
+    "candidate solutions. Some candidates may be correct, others may contain "
+    "errors. Evaluate each candidate against the visual evidence, then produce "
+    "a single, well-reasoned solution. "
+    "End with the most specific entity name in \\boxed{}."
+)
 
 TRAVERSAL_SYSTEM_PROMPT = (
-    "You are a careful visual reasoner for open-world image recognition. "
-    "Your task is to identify the most specific entity in an image using "
-    "structured visual-semantic traversal."
+    "You are a visual entity recognition expert. "
+    "Your task is to identify the most specific entity in an image by first "
+    "retrieving the relevant taxonomy hierarchy from memory. "
+    "For each problem, follow these steps:\n"
+    "1. Describe the visual evidence you observe in the image.\n"
+    "2. Recall the taxonomy chain from broad category to the most specific "
+    "matching entity. Write this inside <traversal> tags, one entity per line.\n"
+    "3. Evaluate your traversal: is the entity at the end truly the most "
+    "specific match? Could a narrower or sibling entity fit better? Consider "
+    "alternatives and explain your reasoning.\n"
+    "4. Output the most specific entity in \\boxed{}."
+)
+
+TRAVERSAL_WIKIDATA_SYSTEM_PROMPT = (
+    "You identify entities in images by traversing the Wikidata subclass (P279) hierarchy. "
+    "Entities are organized from broad categories to specific items through chains of "
+    "subclass edges. Your task is to follow these chains from broad to specific."
 )
 
 # ---------------------------------------------------------------------------
@@ -44,45 +66,68 @@ The image shows a four-wheeled motor vehicle with a enclosed cabin, four doors, 
 Now answer the following problem with the same format:"""
 
 _ONESHOT_AGGREGATION = """\
-Here is an example of the expected format:
+Here is an example showing the expected format and reasoning:
+
 Question: what type of vehicle is this?
-Candidate solutions:
-Solution 1: The four-door vehicle with a rear hatch is a family car. \\boxed{station wagon}
-Solution 2: The raised vehicle with roof rails and plastic cladding is a crossover SUV. \\boxed{crossover SUV}
-Solution 3: A four-wheel drive vehicle with high ground clearance for off-road use. \\boxed{off-road SUV}
-Solution 4: The vehicle with an enclosed cabin and liftgate, combining car-like handling with SUV styling and raised suspension. \\boxed{crossover SUV}
 
-The combination of raised ground clearance, roof rails, plastic wheel-arch cladding, and a rear liftgate on a car-based platform is characteristic of a crossover SUV. Solutions 2 and 4 correctly identify it, while Solution 1 misses the SUV features and Solution 3 describes a body-on-frame off-road vehicle.
-\\boxed{crossover SUV}
+Candidate solutions (may contain mistakes):
+---- Solution 1 ----
+The four-door vehicle with a rear hatch is a family car. \\boxed{station wagon}
+---- Solution 2 ----
+The raised vehicle with roof rails and plastic cladding is a crossover SUV. \\boxed{crossover SUV}
+---- Solution 3 ----
+A four-wheel drive vehicle with high ground clearance for off-road use. \\boxed{off-road SUV}
+---- Solution 4 ----
+The vehicle with an enclosed cabin and liftgate, combining car-like handling with SUV styling and raised suspension. \\boxed{crossover SUV}
 
-Now answer the following problem with the same format. Check each candidate against the image:"""
+Evaluation of each candidate:
+- Solution 1 says "station wagon" — this misses the raised suspension, roof rails, and plastic cladding visible in the image. Incorrect.
+- Solution 2 says "crossover SUV" — the raised ground clearance, roof rails, plastic wheel-arch cladding, and car-based platform are all features of a crossover SUV. Correct.
+- Solution 3 says "off-road SUV" — off-road SUVs are body-on-frame with higher ground clearance and no car-like unibody construction. The image shows a unibody design. Incorrect.
+- Solution 4 says "crossover SUV" — same correct reasoning as Solution 2, also correctly identifies the car-based platform with SUV styling. Correct.
+
+Final answer: \\boxed{crossover SUV}
+
+Now answer the following problem with the same format. Evaluate each candidate against what you see in the image, then produce the most specific entity name in \\boxed{}:"""
 
 _ONESHOT_TRAVERSAL = """\
 Here is an example of the expected format:
-Question: what type of vehicle is this?
-<visual_evidence>
-- Four-wheeled motor vehicle with enclosed cabin and four doors
-- Rear liftgate, not a separate trunk
-- Higher ground clearance than a typical sedan
-- Roof rails and plastic cladding around wheel arches
-</visual_evidence>
-<coarse_category>
-vehicle
-</coarse_category>
-<candidates>
-1. crossover SUV
-2. station wagon
-3. off-road SUV
-</candidates>
+
+Question: what type of plant is shown?
+
+Step 1 — Visual evidence:
+- Small green leaves arranged in a rosette, each leaf tipped with red
+- Hinged trap structures with tooth-like spines along the margins
+- Three sensitive trigger hairs on the inner surface of each trap
+- Grows low to the ground from a bulb-like rhizome
+
+Step 2 — Taxonomy traversal:
 <traversal>
-entity → vehicle → car → sport utility vehicle → crossover SUV
+plant
+flowering plant
+carnivorous plant
+Venus flytrap
 </traversal>
-<decision>
-The unibody construction with raised suspension, roof rails, and plastic cladding distinguishes a crossover SUV from a station wagon (lower, no cladding) and an off-road SUV (body-on-frame, higher clearance, typically no liftgate).
-</decision>
-\\boxed{crossover SUV}
+
+Step 3 — Evaluate:
+The hinged snap-trap with marginal teeth and trigger hairs is unique to the Venus flytrap. Other carnivorous plants have different trapping mechanisms: sundews use sticky glandular tentacles and lack rapid movement; pitcher plants are passive pitfall traps formed from modified leaves. No narrower entity within the carnivorous plant group matches the visual evidence better than Venus flytrap.
+
+Step 4 — Final answer:
+\\boxed{Venus flytrap}
 
 Now answer the following problem with the same format:"""
+
+_ONESHOT_TRAVERSAL_WIKIDATA = """\
+Example: what type of plant is shown?
+<traversal>
+plant
+flowering plant
+carnivorous plant
+Venus flytrap
+</traversal>
+\\boxed{Venus flytrap}
+
+Now answer the following question with the same format:"""
 
 GENERIC_OVEN_QUESTIONS = {
     "what is the main object?",
@@ -140,6 +185,21 @@ def parse_args() -> argparse.Namespace:
         help="Train-row probability of using a structured traversal prompt in rsa_trace mode. "
         "When >0, rows not selected for traversal fall through to the standard/aggregation split. "
         "Default 0.0 preserves existing behaviour.",
+    )
+    parser.add_argument(
+        "--traversal-variant",
+        choices=["structured", "wikidata"],
+        default="structured",
+        help="Traversal prompt style: 'structured' (5-section visual-semantic, current default) "
+        "or 'wikidata' (P279 subclass chain, line-delimited).",
+    )
+    parser.add_argument(
+        "--val-prompt-type",
+        choices=["standard", "traversal"],
+        default="standard",
+        help="Prompt type for val-split rows in rsa_trace mode. 'traversal' builds a "
+        "traversal-prompt validation set so traversal behaviour is measurable at eval time. "
+        "Default 'standard' preserves existing behaviour.",
     )
     parser.add_argument(
         "--question-policy",
@@ -480,14 +540,17 @@ Now answer the following problem with the same format:"""
 
 
 def build_rsa_standard_prompt(question: str, prompt_variant: str = "reasoning") -> list[dict[str, str]]:
+    """Standard prompt — no 1-shot, matching Zhang et al. and RSA paper designs.
+
+    The model learns behaviour from reward, not from imitation.  One-shot
+    examples are kept for evaluation only (structured prompting at test time).
+    """
     if prompt_variant == "compute_buffer":
-        oneshot = _ONESHOT_STANDARD_COMPUTE_BUFFER
         user_prompt = "\n".join(
             [
                 "<image>",
                 "Think step by step about what you see. Then give the most specific entity name in \\boxed{}.",
                 "",
-                oneshot,
                 "Problem:",
                 question.strip(),
                 "",
@@ -495,19 +558,15 @@ def build_rsa_standard_prompt(question: str, prompt_variant: str = "reasoning") 
             ]
         )
     else:
-        oneshot = _ONESHOT_STANDARD
         user_prompt = "\n".join(
             [
                 "<image>",
                 "You are given an image and an open-world visual recognition problem.",
-                "Write a concise solution that uses the image, the question, and relevant visual or world knowledge to identify the most specific entity name.",
-                r"Reason carefully and end with the final answer in \boxed{}.",
+                "Identify the most specific entity shown.",
+                r"End with the final answer in \boxed{}.",
                 "",
-                oneshot,
                 "Problem:",
                 question.strip(),
-                "",
-                r"Now write a concise solution. End with the final answer in \boxed{}.",
             ]
         )
     return [
@@ -517,24 +576,67 @@ def build_rsa_standard_prompt(question: str, prompt_variant: str = "reasoning") 
 
 
 def build_rsa_aggregation_prompt(question: str, candidates: list[str]) -> list[dict[str, str]]:
+    """RSA-style aggregation prompt with a 1-shot example teaching candidate evaluation.
+
+    The 1-shot demonstrates: evaluate each candidate individually against visual
+    evidence, identify which are correct/wrong and why, then select the most
+    specific correct answer in ``\\boxed{}``.
+
+    Follows the prompt structure from Venkatraman et al. (2026, ``eval_loop.py``),
+    adapted for multimodal visual recognition.  Single-candidate rows get a
+    refinement instruction; multi-candidate rows get an aggregation instruction.
+    """
     candidate_blocks = "\n\n".join(
-        f"Solution {idx}:\n{candidate.strip()}" for idx, candidate in enumerate(candidates, start=1)
+        f"---- Solution {idx} ----\n{candidate.strip()}"
+        for idx, candidate in enumerate(candidates, start=1)
     )
+
+    n = len(candidates)
+    if n == 1:
+        instruction = (
+            "You are given an image, a recognition problem, and a candidate solution. "
+            "The candidate may be incomplete or contain errors. "
+            "Evaluate the candidate against what you see in the image. "
+            "If it is correct, confirm why. If it is wrong, explain why and provide "
+            "the correct answer based on the visual evidence. "
+            r"End with the most specific entity name in \boxed{}."
+        )
+        candidate_label = "Candidate solution (may contain mistakes):"
+        closing = (
+            "Now evaluate the candidate solution. "
+            r"Provide your reasoning and end with the final answer in \boxed{}."
+        )
+    else:
+        instruction = (
+            "You are given an image, a recognition problem, and several candidate solutions. "
+            "Some candidates may be correct, others may contain errors. "
+            "Evaluate each candidate individually against what you see in the image, "
+            "explain why it is correct or wrong, then select the best answer. "
+            "If all candidates are wrong, provide the correct answer from your own knowledge. "
+            r"End with the most specific entity name in \boxed{}."
+        )
+        candidate_label = "Candidate solutions (may contain mistakes):"
+        closing = (
+            "Now evaluate each candidate against the image. "
+            "Explain your reasoning for each, then give the final answer in \\boxed{}."
+        )
+
     user_prompt = "\n".join(
         [
-            "<image>",
-            "You are given an image, an open-world visual recognition problem, and several candidate solutions.",
-            "Your task is to synthesize the most reliable answer by checking the candidates against the image and the question.",
-            r"Write a concise improved solution and end with the final answer in \boxed{}.",
-            "",
             _ONESHOT_AGGREGATION,
+            "",
+            "---",
+            "",
+            "<image>",
+            instruction,
+            "",
             "Problem:",
             question.strip(),
             "",
-            "Candidate solutions:",
+            candidate_label,
             candidate_blocks,
             "",
-            r"Now write the improved solution. End with the final answer in \boxed{}.",
+            closing,
         ]
     )
     return [
@@ -544,54 +646,72 @@ def build_rsa_aggregation_prompt(question: str, candidates: list[str]) -> list[d
 
 
 def build_rsa_traversal_prompt(question: str) -> list[dict[str, str]]:
-    """Build a structured traversal prompt that guides the model through taxonomy-aware search.
+    """Zhang et al.-style structured recall prompt with 1-shot example.
 
-    The model is asked to follow a fixed schema:
-      <visual_evidence>  → visible properties
-      <coarse_category>  → broad class
-      <candidates>       → candidate entities at increasing specificity
-      <traversal>        → taxonomy path: broader → finer → most specific
-      <decision>         → why the chosen entity fits the visual evidence
-      \\boxed{...}        → final answer
+    The model follows four numbered steps:
+      1. Visual evidence — describe what you see
+      2. Taxonomy traversal — recall the hierarchy broad→specific in <traversal> tags
+      3. Evaluate — compare against alternatives, verify specificity
+      4. Final answer — the most specific entity in \\boxed{}
+
+    The <traversal> tag enables the reward function's path_match signal;
+    the numbered-step structure matches Zhang et al.'s Structured Recall
+    template, and step 3 (evaluate alternatives) encourages the model to
+    actively compare candidates before committing to an answer.
     """
     user_prompt = "\n".join(
         [
-            "<image>",
-            "You are given an image and an open-world visual recognition question.",
-            "Follow this structured procedure to identify the most specific entity:",
-            "",
-            "<visual_evidence>",
-            "- List 2-4 concrete, directly visible properties of the object or entity in the image.",
-            "</visual_evidence>",
-            "",
-            "<coarse_category>",
-            "- Name the broad category the entity belongs to (e.g., animal, vehicle, building, food, tool, plant).",
-            "</coarse_category>",
-            "",
-            "<candidates>",
-            "- List 3-5 candidate entities at increasing specificity within that category.",
-            "</candidates>",
-            "",
-            "<traversal>",
-            "- Show the taxonomy path from broad class to the chosen entity:",
-            "  broader category → finer category → most specific entity.",
-            "</traversal>",
-            "",
-            "<decision>",
-            "- Explain which visual evidence distinguishes the chosen entity from the alternatives.",
-            "</decision>",
-            "",
-            r"End with the final answer in \boxed{}.",
-            "",
             _ONESHOT_TRAVERSAL,
-            "Question:",
+            "",
+            "---",
+            "",
+            "<image>",
+            "Follow the same four-step procedure shown above.",
+            "",
+            "Problem:",
             question.strip(),
             "",
-            "Now follow the procedure step by step. End with the final answer in \\boxed{}.",
+            "Step 1 — Visual evidence:",
         ]
     )
     return [
         {"role": "system", "content": TRAVERSAL_SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
+    ]
+
+
+def build_rsa_traversal_wikidata_prompt(question: str) -> list[dict[str, str]]:
+    """Build a Wikidata-aware traversal prompt.
+
+    Teaches the model to output a P279 subclass chain inside <traversal> tags,
+    one entity per line, from broad category to most specific entity.
+    """
+    user_prompt = "\n".join(
+        [
+            "<image>",
+            question.strip(),
+            "",
+            "Output the Wikidata subclass (P279) chain from broad category to",
+            "the most specific entity matching the image.",
+            "Write one entity per line inside <traversal> tags:",
+            "",
+            "<traversal>",
+            "broad category",
+            "finer subclass",
+            "...",
+            "most specific entity",
+            "</traversal>",
+            "",
+            r"End with the final answer in \boxed{}.",
+            "",
+            "Problem:",
+            question.strip(),
+            "",
+            "<traversal>",
+        ]
+    )
+    return [
+        {"role": "system", "content": TRAVERSAL_WIKIDATA_SYSTEM_PROMPT},
         {"role": "user", "content": user_prompt},
     ]
 
@@ -636,8 +756,10 @@ def choose_prompt_type(
     candidates_by_id: dict[str, list[str]],
     rng: random.Random,
 ) -> tuple[str, list[str], list[int], str]:
-    if args.dataset_mode != "rsa_trace" or parquet_split != "train":
-        return "standard" if args.dataset_mode == "rsa_trace" else "direct", [], [], ""
+    if args.dataset_mode != "rsa_trace":
+        return "direct", [], [], ""
+    if parquet_split != "train":
+        return args.val_prompt_type, [], [], ""
 
     # Traversal roll first (opt-in via --traversal-fraction)
     if args.traversal_fraction > 0 and rng.random() < args.traversal_fraction:
@@ -711,7 +833,10 @@ def make_record(
         prompt = build_rsa_aggregation_prompt(question, candidate_solutions)
         answer_format = "boxed"
     elif prompt_type == "traversal":
-        prompt = build_rsa_traversal_prompt(question)
+        if args.traversal_variant == "wikidata":
+            prompt = build_rsa_traversal_wikidata_prompt(question)
+        else:
+            prompt = build_rsa_traversal_prompt(question)
         answer_format = "boxed"
     else:
         prompt = build_rsa_standard_prompt(question, prompt_variant=args.standard_prompt_variant)
@@ -1010,6 +1135,8 @@ def main() -> None:
         "aggregation_fraction": args.aggregation_fraction if args.dataset_mode == "rsa_trace" else 0.0,
         "aggregation_k": args.aggregation_k if args.dataset_mode == "rsa_trace" else 0,
         "traversal_fraction": args.traversal_fraction if args.dataset_mode == "rsa_trace" else 0.0,
+        "traversal_variant": args.traversal_variant if args.dataset_mode == "rsa_trace" else "structured",
+        "val_prompt_type": args.val_prompt_type if args.dataset_mode == "rsa_trace" else "standard",
         "standard_prompt_variant": args.standard_prompt_variant if args.dataset_mode == "rsa_trace" else "reasoning",
         "candidate_solution_rows": len(candidates_by_id),
         "answer_format": "boxed" if args.dataset_mode == "rsa_trace" else "plain",
