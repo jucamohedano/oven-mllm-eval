@@ -19,7 +19,7 @@ Criteria (``--criterion``):
 
 Usage (cluster)::
 
-    python scripts/select_examples.py \
+    python analysis/select_examples.py \
       --standard 2B=<...>_samples_scored_qwen_qwen3-4b_with_desc_rich.jsonl \
                  4B=<...> 8B=<...> 32B=<...> \
       --rsa 2B=<...>_samples_judged_rsa_solution_n16_k4_t5_qwen_qwen3-4b_with_desc_rich.jsonl \

@@ -15,7 +15,7 @@ images pulled back with ``sync.sh --pull-images``, and writes, under
 
 Usage::
 
-    python scripts/render_examples.py \
+    python analysis/render_examples.py \
       --selection viz/examples/selected_examples_qwen.json \
       --image-dir data/images \
       --out-prefix viz/examples/rsa_wins_qwen

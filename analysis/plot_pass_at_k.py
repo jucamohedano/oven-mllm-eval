@@ -6,7 +6,7 @@ pass@k metrics, and produces a comparison plot.
 
 Usage::
 
-    uv run python scripts/plot_pass_at_k.py \
+    uv run python analysis/plot_pass_at_k.py \
         --logs-root logs/schedule/oven_naive-sampling_concise \
         --output viz/pass_at_k_comparison.png
 """

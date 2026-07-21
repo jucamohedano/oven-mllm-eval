@@ -4,8 +4,8 @@ A judge positive (the LM marked a rollout correct) is "supported" when it can
 be mechanically verified against the ground truth by exact match, a known
 alias, or containment.  This module is the single source of truth for that
 classification, used by both the batch auditor
-(``scripts/audit_judge_false_positives.py``) and the interactive dashboard
-(``scripts/explore_judgments.py``).
+(``analysis/audit_judge_false_positives.py``) and the interactive dashboard
+(``analysis/explore_judgments.py``).
 
 Note: ``normalize`` here is intentionally more aggressive than
 ``oven_mllm_eval.scores.normalize`` — it strips HTML/markup and collapses

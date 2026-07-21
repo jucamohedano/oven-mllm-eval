@@ -8,7 +8,7 @@ example and response, and writes it inside a ``verbatim``-style LaTeX box.
 
 Usage::
 
-    python scripts/render_judge_prompt.py \
+    python analysis/render_judge_prompt.py \
       --selection viz/examples/rsa_rescues_qwen.json \
       --data-id oven_entity_val_00025942 \
       --response "The image shows ... \\boxed{Eastern box turtle}" \

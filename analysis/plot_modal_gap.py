@@ -9,7 +9,7 @@ means it explores different answers.
 
 Usage::
 
-    uv run python scripts/plot_modal_gap.py \
+    uv run python analysis/plot_modal_gap.py \
         --scored-a logs/schedule/.../2b_run/*_scored.jsonl \
         --scored-b logs/schedule/.../8b_run/*_scored.jsonl \
         --label-a "Qwen3-VL 2B" --label-b "Qwen3-VL 8B" \

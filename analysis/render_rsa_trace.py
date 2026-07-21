@@ -22,7 +22,7 @@ Standard-sampling context is read from the selection JSON (optional).
 
 Usage::
 
-    python scripts/render_rsa_trace.py \
+    python analysis/render_rsa_trace.py \
       --trace viz/examples/traces/late_solve_traces_8B.jsonl \
       --data-id oven_entity_val_00078437 \
       --model 8B \

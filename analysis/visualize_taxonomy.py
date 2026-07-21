@@ -7,13 +7,13 @@ they exist on disk) or the image path as a tooltip.
 
 Usage:
     # Sample 5 random chains
-    python scripts/visualize_taxonomy.py --n-chains 5
+    python analysis/visualize_taxonomy.py --n-chains 5
 
     # Sample chains containing a specific label
-    python scripts/visualize_taxonomy.py --n-chains 5 --filter "aircraft"
+    python analysis/visualize_taxonomy.py --n-chains 5 --filter "aircraft"
 
     # More chains, only deep ones
-    python scripts/visualize_taxonomy.py --n-chains 20 --min-depth 4
+    python analysis/visualize_taxonomy.py --n-chains 20 --min-depth 4
 """
 from __future__ import annotations
 

@@ -3,7 +3,7 @@
 
 Usage::
 
-    uv run --extra analysis python scripts/plot_per_rollout_accuracy.py \
+    uv run --extra analysis python analysis/plot_per_rollout_accuracy.py \
         --run-dirs <dir1> <dir2> ... \
         --common-only \
         --output viz/per_rollout_accuracy.png

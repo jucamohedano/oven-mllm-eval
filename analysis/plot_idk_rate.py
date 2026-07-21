@@ -6,7 +6,7 @@ fraction of rollouts where the model explicitly refuses to answer.
 
 Usage::
 
-    uv run python scripts/plot_idk_rate.py \
+    uv run python analysis/plot_idk_rate.py \
         --scored-dir logs/schedule/oven_naive-sampling_concise \
         --output viz/idk_rate.png
 """

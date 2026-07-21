@@ -15,7 +15,7 @@ comparison model has cᵢ = 0.
 
 Usage::
 
-    uv run python scripts/plot_ci_distribution.py \
+    uv run python analysis/plot_ci_distribution.py \
         --scored-2b logs/schedule/.../2b_run \
         --scored-4b logs/schedule/.../4b_run \
         --scored-8b logs/schedule/.../8b_scored.jsonl \

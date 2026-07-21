@@ -3,7 +3,7 @@
 
 Usage::
 
-    uv run streamlit run scripts/explore_judgments.py -- \
+    uv run streamlit run analysis/explore_judgments.py -- \
         --scored logs/schedule/.../2b_run/*_scored.jsonl
 """
 

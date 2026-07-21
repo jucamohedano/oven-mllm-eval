@@ -11,11 +11,11 @@ It plots only taxonomy-aware metrics:
   - mapped-only views
   - all-example views, where unmapped examples are zero-filled
 
-Use ``scripts/plot_pass_at_k.py`` for pass@k plots.
+Use ``analysis/plot_pass_at_k.py`` for pass@k plots.
 
 Example:
 
-    python scripts/plot_hierarchical_metrics.py \
+    python analysis/plot_hierarchical_metrics.py \
         --results \
           2B=logs/.../2b_results_recomputed.json \
           4B=logs/.../4b_results_recomputed.json \

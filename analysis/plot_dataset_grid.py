@@ -11,7 +11,7 @@ available locally; otherwise any local image of that dataset is used.
 
 Usage::
 
-    python scripts/plot_dataset_grid.py \
+    python analysis/plot_dataset_grid.py \
       --image-dir data/images \
       --out viz/dataset_grid/oven_dataset_grid.png
 """
