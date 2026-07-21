@@ -10,6 +10,12 @@ Open-domain visual entity recognition on **OVEN**, measured with a specificity-p
 
 Juan Camacho Mohedano · University of Trento
 
+<br>
+
+<img src="assets/teaser.png" width="100%" alt="One image, five correct answers at different levels of specificity: animal, dog, Canis lupus familiaris, retriever, Golden Retriever">
+
+<sub>The same image has many correct answers. Flat accuracy picks one and marks the rest wrong.</sub>
+
 </div>
 
 ______________________________________________________________________
@@ -216,6 +222,7 @@ ______________________________________________________________________
 | `logs/schedule/` | Run outputs, one timestamped directory per run |
 | `viz/` | Generated figures and tables |
 | `docs/` | Methods, runbooks, findings, and research notes |
+| `assets/` | Images used by this README (`teaser.png` comes from `analysis/plot_specificity_ambiguity.py`) |
 
 The `scripts/` vs `analysis/` split is deliberate: `scripts/` produces the canonical run
 artifacts, `analysis/` only consumes them. The dependency runs one way, so analysis code
