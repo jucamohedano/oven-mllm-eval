@@ -28,34 +28,15 @@ import json
 import shutil
 from pathlib import Path
 
+from _common import find_image, tex_escape
+
 
 CHECK = r"\cmark"   # define in preamble: \newcommand{\cmark}{\ding{51}}
 CROSS = r"\xmark"   #                       \newcommand{\xmark}{\ding{55}}
 
 
-def _tex_escape(text: str) -> str:
-    if text is None:
-        return ""
-    return (
-        str(text)
-        .replace("\\", r"\textbackslash{}")
-        .replace("&", r"\&").replace("%", r"\%").replace("$", r"\$")
-        .replace("#", r"\#").replace("_", r"\_")
-        .replace("{", r"\{").replace("}", r"\}")
-        .replace("~", r"\textasciitilde{}").replace("^", r"\textasciicircum{}")
-    )
-
-
 def _mark(correct: bool) -> str:
     return CHECK if correct else CROSS
-
-
-def _resolve_image(image_id: str, image_dir: Path) -> Path | None:
-    for ext in (".jpg", ".jpeg", ".JPEG", ".JPG", ".png"):
-        p = image_dir / f"{image_id}{ext}"
-        if p.exists():
-            return p
-    return None
 
 
 def _fmt_hf(v) -> str:
@@ -69,8 +50,8 @@ def render_main(examples, models_std, models_rsa, fig_reldir) -> str:
              r"% \newcommand{\xmark}{\textcolor{red!70!black}{\ding{55}}}",
              ""]
     for i, ex in enumerate(examples, 1):
-        q = _tex_escape(ex["question"])
-        ans = _tex_escape(ex["answer"])
+        q = tex_escape(ex["question"])
+        ans = tex_escape(ex["answer"])
         img_id = ex["image_id"]
         rsa_present = bool(ex.get("rsa"))
         ncols = "ll" + ("l" if rsa_present else "")
@@ -92,11 +73,11 @@ def render_main(examples, models_std, models_rsa, fig_reldir) -> str:
             s = ex["standard"].get(m)
             if not s:
                 continue
-            std_cell = f"{_tex_escape(s['best'])} {_mark(s['hit'])}"
+            std_cell = f"{tex_escape(s['best'])} {_mark(s['hit'])}"
             row = [m, std_cell]
             if rsa_present:
                 r = ex["rsa"].get(m)
-                row.append(f"{_tex_escape(r['best'])} {_mark(r['hit'])}" if r else "--")
+                row.append(f"{tex_escape(r['best'])} {_mark(r['hit'])}" if r else "--")
             lines.append(" & ".join(row) + r" \\")
         lines += [
             r"\bottomrule",
@@ -115,8 +96,8 @@ def render_appendix(examples, models_std, models_rsa) -> str:
     """Per example: top-N standard answers + RSA iteration trace."""
     lines = ["% Requires: booktabs", ""]
     for i, ex in enumerate(examples, 1):
-        q = _tex_escape(ex["question"])
-        ans = _tex_escape(ex["answer"])
+        q = tex_escape(ex["question"])
+        ans = tex_escape(ex["answer"])
         lines += [
             rf"\paragraph{{Example {i}: {q} (GT: {ans})}}",
             "",
@@ -136,7 +117,7 @@ def render_appendix(examples, models_std, models_rsa) -> str:
             parts = []
             for t in s["top"]:
                 mk = CHECK if t["correct"] else ""
-                parts.append(f"{_tex_escape(t['answer'])}~($\\times${t['count']}){mk}")
+                parts.append(f"{tex_escape(t['answer'])}~($\\times${t['count']}){mk}")
             lines.append(f"{m} & " + ", ".join(parts) + r" \\")
         lines += [r"\bottomrule", r"\end{tabular}}", ""]
 
@@ -165,7 +146,7 @@ def render_appendix(examples, models_std, models_rsa) -> str:
                     # Prefer the recorded majority + correctness; fall back to top.
                     ans = it.get("majority") or (it["top"][0]["answer"] if it["top"] else "")
                     mk = _mark(it["majority_correct"]) if "majority_correct" in it else ""
-                    cell = f"{_tex_escape(ans)}~{mk}".strip() if ans else "--"
+                    cell = f"{tex_escape(ans)}~{mk}".strip() if ans else "--"
                     cells.append(cell)
                 cells += ["--"] * (1 + max_steps - len(cells))
                 lines.append(" & ".join(cells[:1 + max_steps]) + r" \\")
@@ -205,7 +186,7 @@ def main() -> None:
     image_dir = Path(args.image_dir)
 
     if args.skip_missing_images:
-        kept = [ex for ex in examples if _resolve_image(ex["image_id"], image_dir)]
+        kept = [ex for ex in examples if find_image(ex["image_id"], image_dir)]
         dropped = len(examples) - len(kept)
         if dropped:
             print(f"[skip] dropped {dropped} example(s) with no local image")
@@ -222,7 +203,7 @@ def main() -> None:
     # Copy images; warn on any missing so the user knows to pull them.
     missing = []
     for ex in examples:
-        src = _resolve_image(ex["image_id"], image_dir)
+        src = find_image(ex["image_id"], image_dir)
         if src is None:
             missing.append((ex["image_id"], ex["entity_id"]))
             continue

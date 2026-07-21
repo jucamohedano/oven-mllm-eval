@@ -40,6 +40,8 @@ import shutil
 from collections import Counter
 from pathlib import Path
 
+from _common import find_image
+
 
 def _strip(text: str) -> str:
     text = text.strip()
@@ -143,14 +145,6 @@ def _tex_prompt(text: str) -> str:
     return text.replace(SENT, r"{\textbackslash}boxed\{\}")
 
 
-def _resolve_image(image_id: str, image_dir: Path) -> Path | None:
-    for ext in (".jpg", ".jpeg", ".JPEG", ".JPG", ".png"):
-        p = image_dir / f"{image_id}{ext}"
-        if p.exists():
-            return p
-    return None
-
-
 def main() -> None:
     ap = argparse.ArgumentParser(description="Render one RSA example as a per-step reasoning trace")
     ap.add_argument("--trace", required=True, help="Trace JSONL with rsa_populations_by_step")
@@ -199,7 +193,7 @@ def main() -> None:
     out_prefix = Path(args.out_prefix)
     fig_dir = out_prefix.parent / f"{out_prefix.name}_figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
-    src = _resolve_image(image_id, Path(args.image_dir))
+    src = find_image(image_id, Path(args.image_dir))
     if src:
         shutil.copy(src, fig_dir / f"{image_id}{src.suffix}")
     else:

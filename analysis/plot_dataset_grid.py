@@ -24,6 +24,8 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 
+from _common import find_image
+
 # The 9 OVEN source datasets, in the grid order (row-major), with a display name.
 DATASETS = [
     ("imagenet21k", "ImageNet21k-P"),
@@ -46,14 +48,6 @@ PREFERRED = {
 }
 
 
-def resolve_image(image_id: str, image_dir: Path) -> Path | None:
-    for ext in (".jpg", ".jpeg", ".JPEG", ".JPG", ".png"):
-        p = image_dir / f"{image_id}{ext}"
-        if p.exists():
-            return p
-    return None
-
-
 def build_index(aligned: Path, image_dir: Path) -> dict[str, list[tuple[str, str]]]:
     """dataset -> [(image_id, label), ...] restricted to locally-present images."""
     by_ds: dict[str, list[tuple[str, str]]] = {ds: [] for ds, _ in DATASETS}
@@ -65,7 +59,7 @@ def build_index(aligned: Path, image_dir: Path) -> dict[str, list[tuple[str, str
             iid = r.get("image_id", "")
             if ds not in by_ds or iid in seen:
                 continue
-            if resolve_image(iid, image_dir) is None:
+            if find_image(iid, image_dir) is None:
                 continue
             seen.add(iid)
             label = r.get("entity_text") or r.get("answer") or ""
@@ -105,7 +99,7 @@ def main() -> None:
             ax.add_patch(plt.Rectangle((0, 0), 1, 1, color="0.92"))
             continue
         iid, label = chosen
-        img = plt.imread(resolve_image(iid, image_dir))
+        img = plt.imread(find_image(iid, image_dir))
         ax.imshow(img)
         ax.set_title(display, fontsize=13, fontweight="bold", pad=4)
         ax.text(0.5, -0.06, label, transform=ax.transAxes, ha="center", va="top",

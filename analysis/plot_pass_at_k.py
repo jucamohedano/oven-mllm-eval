@@ -18,6 +18,8 @@ import json
 import re
 from pathlib import Path
 
+from _common import tex_escape
+
 
 MODEL_ORDER = ["Qwen3-VL 2B", "Qwen3-VL 4B", "Qwen3-VL 8B", "Qwen3-VL 32B"]
 MODEL_COLORS = {
@@ -176,19 +178,6 @@ def _pass_k_keys(
     return sorted(keys, key=_pass_k_index)
 
 
-def _tex_escape(text: str) -> str:
-    return (
-        text.replace("\\", r"\textbackslash{}")
-        .replace("&", r"\&")
-        .replace("%", r"\%")
-        .replace("$", r"\$")
-        .replace("#", r"\#")
-        .replace("_", r"\_")
-        .replace("{", r"\{")
-        .replace("}", r"\}")
-    )
-
-
 def _format_pass_value(pass_k: dict[str, float] | None, key: str) -> str:
     if not pass_k or key not in pass_k:
         return "--"
@@ -240,7 +229,7 @@ def _latex_pass_at_k_table(
             r"\centering",
             r"\small",
             r"\setlength{\tabcolsep}{3.5pt}",
-            rf"\caption{{{_tex_escape(caption)}}}",
+            rf"\caption{{{tex_escape(caption)}}}",
             rf"\label{{{table_label}}}",
             rf"\begin{{tabular}}{{{colspec}}}",
             r"\toprule",
@@ -253,15 +242,15 @@ def _latex_pass_at_k_table(
         if has_secondary:
             primary_values = [_format_pass_value(results.get(label), key) for key in keys]
             lines.append(
-                f"{_tex_escape(label)} & {_tex_escape(label1)} & " + " & ".join(primary_values) + r" \\"
+                f"{tex_escape(label)} & {tex_escape(label1)} & " + " & ".join(primary_values) + r" \\"
             )
             secondary_values = [_format_pass_value(results2.get(label) if results2 else None, key) for key in keys]
             lines.append(
-                f" & {_tex_escape(method_label2)} & " + " & ".join(secondary_values) + r" \\"
+                f" & {tex_escape(method_label2)} & " + " & ".join(secondary_values) + r" \\"
             )
         else:
             values = [_format_pass_value(results.get(label), key) for key in keys]
-            lines.append(f"{_tex_escape(label)} & " + " & ".join(values) + r" \\")
+            lines.append(f"{tex_escape(label)} & " + " & ".join(values) + r" \\")
 
     lines.extend([r"\bottomrule", r"\end{tabular}", r"\end{table*}"])
     return "\n".join(lines) + "\n"

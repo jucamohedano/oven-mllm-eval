@@ -31,6 +31,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from _common import tex_escape
+
 
 STANDARD_METRICS = ["hP", "hR", "hF"]
 SPECIFIC_METRICS = ["specific_hP", "specific_hR", "specific_hF"]
@@ -144,19 +146,6 @@ def _print_table(
             print(f"{label}\t{measure}\t" + "\t".join(values))
 
 
-def _tex_escape(text: str) -> str:
-    return (
-        text.replace("\\", r"\textbackslash{}")
-        .replace("&", r"\&")
-        .replace("%", r"\%")
-        .replace("$", r"\$")
-        .replace("#", r"\#")
-        .replace("_", r"\_")
-        .replace("{", r"\{")
-        .replace("}", r"\}")
-    )
-
-
 def _metric_value(metrics: dict[str, Any], key: str) -> str:
     value = metrics.get(key)
     if isinstance(value, (int, float)):
@@ -187,7 +176,7 @@ def _latex_table(
     cmidrules = []
     start_col = 2
     for measure in table_measures:
-        group_header.append(rf"\multicolumn{{3}}{{c}}{{{_tex_escape(MEASURE_TITLES.get(measure, measure))}}}")
+        group_header.append(rf"\multicolumn{{3}}{{c}}{{{tex_escape(MEASURE_TITLES.get(measure, measure))}}}")
         end_col = start_col + len(metric_keys) - 1
         cmidrules.append(rf"\cmidrule(lr){{{start_col}-{end_col}}}")
         start_col = end_col + 1
@@ -201,7 +190,7 @@ def _latex_table(
         for measure in table_measures:
             metrics = runs[label][measure]
             values.extend(_metric_value(metrics, key) for key in metric_keys)
-        lines.append(f"{_tex_escape(label)} & " + " & ".join(values) + r" \\")
+        lines.append(f"{tex_escape(label)} & " + " & ".join(values) + r" \\")
 
     lines.extend([r"\bottomrule", r"\end{tabular}", r"\end{table}"])
     return "\n".join(lines) + "\n"
