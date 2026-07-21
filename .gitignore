@@ -40,13 +40,18 @@ uv.lock
 
 # User-specific config (sync targets, cluster paths)
 configs/sync.conf
-commands.md
 data/processed/vlm_compatible_val_aligned.jsonl
 data/raw/
 data/available_images.txt
 viz/
-docs/
 CLAUDE.md
 tests/
 .mplconfig/
 lib/
+
+# Thesis writing material: versioned separately, large binaries, or third-party PDFs
+docs/thesis_latex/
+docs/thesis_supporting_material/
+docs/presentation/
+docs/tmp/
+docs/thesis-TODOs/
