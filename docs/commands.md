@@ -478,7 +478,7 @@ bash scripts/schedule_sbatch.sh -A EUHPC_D33_243 -p boost_usr_prod \
 
 ### Running audit
 
-python scripts/audit_judge_false_positives.py \
+python analysis/audit_judge_false_positives.py \
     logs/schedule/oven_naive-sampling_concise_no_idk/qwen_qwen3-vl-2b-
     instruct/20260614_121741_936810/20260614_121741_936810_scored.jsonl \
     logs/schedule/oven_naive-sampling_concise_no_idk/qwen_qwen3-vl-4b-
@@ -510,7 +510,7 @@ python scripts/audit_judge_false_positives.py \
 
 
 ### generate pass@k
-python scripts/plot_pass_at_k.py \
+python analysis/plot_pass_at_k.py \
     --run-dirs \
       logs/schedule/oven_naive-sampling_concise_no_idk/qwen_qwen3-vl-2b-instruct/20260614_121741_936810 \
       logs/schedule/oven_naive-sampling_concise_no_idk/qwen_qwen3-vl-4b-instruct/20260614_123428_725972 \
@@ -520,7 +520,7 @@ python scripts/plot_pass_at_k.py \
 
 
 ### plotting ci distribution
-python scripts/plot_ci_distribution.py \
+python analysis/plot_ci_distribution.py \
     --scored-2b logs/schedule/oven_naive-sampling_concise_no_idk/qwen_qwen3-vl-2b-
     instruct/20260614_121741_936810/20260614_121741_936810_scored.jsonl \
     --scored-4b logs/schedule/oven_naive-sampling_concise_no_idk/qwen_qwen3-vl-4b-
@@ -532,7 +532,7 @@ python scripts/plot_ci_distribution.py \
 
 
 ### Explore models
-uv run streamlit run scripts/explore_judgments.py -- \
+uv run streamlit run analysis/explore_judgments.py -- \
     --scored logs/schedule/oven_naive-sampling_concise_no_idk/qwen_qwen3-vl-2b-instruct/20260614_121741_936810/20260614_121741_936810_scored.jsonl \
     --max-samples 100
 
@@ -1155,7 +1155,7 @@ sent 572 bytes  received 23.62K bytes  6.91K bytes/sec
 total size is 180.19K  speedup is 7.45
 
 
-python scripts/plot_pass_at_k.py \
+python analysis/plot_pass_at_k.py \
     --results-pattern "*results_google_gemma-4-e4b-it_with_desc_rich.json" \
     --run-dirs \
     logs/schedule/oven_naive-sampling_concise_no_idk/qwen_qwen3-vl-2b-instruct/20260614_121741_936810 \
@@ -1167,7 +1167,7 @@ python scripts/plot_pass_at_k.py \
 
 logs/schedule/oven_naive-sampling_concise_no_idk/qwen_qwen3-vl-32b-instruct/20260614_201554_466144
 
-python scripts/plot_hierarchical_metrics.py \
+python analysis/plot_hierarchical_metrics.py \
     --results \
       Qwen3-VL-2B=logs/schedule/oven_naive-sampling_concise_no_idk/qwen_qwen3-vl-2b-instruct/20260614_121741_936810/20260614_121741_936810_results_qwen_qwen3-4b_with_desc_rich_recomputed.json \
       Qwen3-VL-4B=logs/schedule/oven_naive-sampling_concise_no_idk/qwen_qwen3-vl-4b-instruct/20260614_123428_725972/20260614_123428_725972_results_qwen_qwen3-4b_with_desc_rich_recomputed.json \
@@ -2128,7 +2128,7 @@ PY
 
 
 
-python scripts/select_examples.py \
+python analysis/select_examples.py \
   --standard \
     2B=$R2/20260614_121741_936810_samples_scored_qwen_qwen3-4b_with_desc_rich.jsonl \
     4B=$R4/20260614_123428_725972_samples_scored_qwen_qwen3-4b_with_desc_rich.jsonl \

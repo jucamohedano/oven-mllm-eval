@@ -5,7 +5,7 @@
 - **Models:** Qwen3-VL-2B-Instruct, -4B-Instruct, -8B-Instruct (Qwen3-VL technical report, arXiv:2511.21631v2).
 - **Task / dataset:** OVEN (Open-domain Visual ENtity recognition; Hu et al., arXiv:2302.11154), validation split, **aligned** taxonomy-question variant (`data/processed/vlm_compatible_val_aligned.jsonl`, **115,552** examples).
 - **Prompt:** `concise_no_idk`. **Inference:** naive-sampling, 256 rollouts/example. **Judge:** Qwen3-4B free-form, **no-evidence prompt** (`build_judge_prompt_free_form` — no descriptions, no taxonomy evidence; the coexisting `*_with_desc` pass is NOT used here — see §5). **Scoring:** taxonomy-aware hP/hR/hF + exact, pass@k via unbiased Codex estimator.
-- **Source artifacts:** `scripts/audit_judge_false_positives.py`, `scripts/plot_ci_distribution.py`, `src/oven_mllm_eval/judge_audit.py`, `viz/ci_distribution/ci_distribution_supported_aligned_concise_no_idk.png`.
+- **Source artifacts:** `analysis/audit_judge_false_positives.py`, `analysis/plot_ci_distribution.py`, `src/oven_mllm_eval/judge_audit.py`, `viz/ci_distribution/ci_distribution_supported_aligned_concise_no_idk.png`.
 - **Related docs:** `docs/findings/prompt-collapse-and-question-misalignment.md`, `docs/findings/model-diversity-and-dedup.md`.
 - **Related notes:** [[002-taxonomy-mapping-and-rollout-metrics]] — the hP/hR/hF mapping cascade and rollout aggregation; its graded crediting of under-specific answers is the complement to this note's specificity-preserving (binary) support set (see 002 §5).
 
@@ -37,7 +37,7 @@ So "pass@256" is just "fraction of examples solved at least once in 256 tries." 
 
 ## 2. The audit table (the primary evidence)
 
-Produced by `scripts/audit_judge_false_positives.py --details` over the three `*_scored.jsonl` files (aligned, `concise_no_idk`, with-image, Qwen3-4B judge). **Support = exact ∨ alias ∨ answer⊆prediction ∨ alias⊆prediction**, all **whole-token** and specificity-preserving (see §5):
+Produced by `analysis/audit_judge_false_positives.py --details` over the three `*_scored.jsonl` files (aligned, `concise_no_idk`, with-image, Qwen3-4B judge). **Support = exact ∨ alias ∨ answer⊆prediction ∨ alias⊆prediction**, all **whole-token** and specificity-preserving (see §5):
 
 | Run | Rows | k | JudgeHit | SuppHit | J p@1 | S p@1 | J p@k | S p@k | J Pos | S Pos | S/J | UndSpec/J | JPos/Hit μ (med) |
 |-----|------|---|----------|---------|-------|-------|-------|-------|-------|-------|-----|-----------|------|
@@ -77,7 +77,7 @@ Support breakdown (rollout counts, `--details`):
 
 ## 3. The cᵢ distribution (mechanism)
 
-Plot: `viz/ci_distribution/ci_distribution_supported_aligned_concise_no_idk.png` (**supported-cᵢ, specificity-preserving**; `scripts/plot_ci_distribution.py --supported`). cᵢ = number of the 256 rollouts that are *supported* positives for example *i*. The histogram y-axis is **% of that model's own supported-solved examples** (cᵢ ≥ 1) — a per-model *conditional* shape, each summing to 100%.
+Plot: `viz/ci_distribution/ci_distribution_supported_aligned_concise_no_idk.png` (**supported-cᵢ, specificity-preserving**; `analysis/plot_ci_distribution.py --supported`). cᵢ = number of the 256 rollouts that are *supported* positives for example *i*. The histogram y-axis is **% of that model's own supported-solved examples** (cᵢ ≥ 1) — a per-model *conditional* shape, each summing to 100%.
 
 The distribution is **bimodal**: a low-cᵢ tail (fragile single-ish hits) plus a large concentrated bin at 129–256 (model nails it across most rollouts). Both ends now order cleanly by size:
 
@@ -264,7 +264,7 @@ Report notes even the 2B has strong reasoning (e.g. MathVista-mini 73.6) while 8
 - [x] **Verify the three audited runs are apples-to-apples** — DONE. All three are aligned, `concise_no_idk`, with-image (`no_image=None`), Qwen3-4B judge. 2B = `…2b-instruct/20260614_121741_936810`, 4B = `…4b-instruct/20260614_123428_725972`, 8B = `…8b-instruct/20260614_123530_550630`.
 - [x] **Tabulate per-hit concentration** — DONE (§2): median judge-pos/hit 29 (2B) / 82 (4B) / 110 (8B), monotonic.
 - [x] **4B "anomaly"** — RESOLVED: it was an artifact of `answer_contains_prediction`; under corrected support 4B is monotonic between 2B and 8B. (§4)
-- [ ] Inspect the **unsupported judge positives** in the dashboard (`scripts/explore_judgments.py`, now support-aware): of the ~59–64% judge positives that are unsupported, what fraction are legitimate paraphrases (judge correct) vs. judge errors vs. under-specific? Bounds how much the supported lower bound undercounts.
+- [ ] Inspect the **unsupported judge positives** in the dashboard (`analysis/explore_judgments.py`, now support-aware): of the ~59–64% judge positives that are unsupported, what fraction are legitimate paraphrases (judge correct) vs. judge errors vs. under-specific? Bounds how much the supported lower bound undercounts.
 - [x] **Word-boundary containment + alias-containment** — DONE (rev 3, §10). Whole-token matching (`_phrase_in`) replaced raw substring; added `contains_alias` (alias ⊆ pred) over all aliases with a short/numeric seed floor. S p@k essentially unchanged (0.317/0.328/0.342) — headline robust.
 - [ ] Qualitatively inspect the residual **2B-solves / 8B-misses supported** set (n=8,319) — what entity types, and are they genuine or judge noise?
 - [~] Re-run with the description-augmented judge (`--judge-with-desc`) — **PARTIAL (§4.5):** the evidence-aware judge lowered pass@k uniformly (pass@256 −0.06/model) but did **not** flip the smaller-broader ordering. Still open: recompute `judge_audit` `UndSpec/J` + supported coverage on the with-desc verdicts (to quantify the J-vs-S gap under the grounded judge), and try a Qwen3-8B judge.

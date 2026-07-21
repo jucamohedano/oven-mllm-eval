@@ -150,7 +150,7 @@ ______________________________________________________________________
 | `scripts/run_inference.py` | vLLM rollouts (`naive`, `naive-sampling`, `iterative`) |
 | `scripts/run_judge.py` | LM-as-judge verdict per rollout |
 | `scripts/score_predictions.py` | Taxonomy mapping, hP/hR/hF, pass@k |
-| `scripts/run_recursive_self_agg.py` | Recursive self-aggregation (N=16, K=4, T=5) |
+| `scripts/run_recursive_self_agg.py` | Recursive self-aggregation over a rollout population |
 | `scripts/schedule_sbatch.sh` | Submit the inference → judge → scoring chain to Slurm |
 | `scripts/sync.sh` | rsync workspace to the cluster and pull results back |
 
@@ -238,9 +238,9 @@ ______________________________________________________________________
 ## Citation
 
 ```bibtex
-@mastersthesis{camachomohedano2026taxonomy,
-  title  = {Taxonomy-Aware Evaluation of Multimodal LLMs on Open-Domain
-            Visual Entity Recognition},
+@mastersthesis{camachomohedano2026knowledge,
+  title  = {What Do Large Multimodal Models Really Know? Unlocking Knowledge
+            Through Test-Time Computation in Open-World Image Classification},
   author = {Camacho Mohedano, Juan},
   school = {University of Trento},
   year   = {2026}
@@ -249,6 +249,7 @@ ______________________________________________________________________
 
 ## Acknowledgements
 
-Built on [OVEN](https://open-vision-language.github.io/oven/) for the benchmark and on
-Snæbjarnarson et al. for the taxonomy-aware hierarchical measures (hP/hR/hF) that this
-evaluation adapts. The scoring and matching code started from the `vlm-eval` codebase.
+The benchmark is OVEN, from *Open-domain Visual Entity Recognition: Towards Recognizing
+Millions of Wikipedia Entities* (Hu et al., ICCV 2023). The hierarchical hP/hR/hF measures
+are adapted from *Taxonomy-Aware Evaluation of Vision-Language Models* (Snæbjarnarson et
+al., CVPR 2025). The scoring and matching code started from the `vlm-eval` codebase.

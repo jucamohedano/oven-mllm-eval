@@ -470,8 +470,8 @@ should be read together with `linked` (≈0.59).
   `grpo_results_table.tex`/`.md`, `grpo_generation_examples.md`,
   `grpo_val_metrics.csv`, `plot_commands.md`).
 - Scripts: `verl/scripts/parse_wandb_datastore.py` (datastore → CSV),
-  `oven-mllm-eval/scripts/plot_grpo_training.py` (figure + tables),
-  `oven-mllm-eval/scripts/extract_grpo_generation_examples.py` (examples).
+  `oven-mllm-eval/analysis/plot_grpo_training.py` (figure + tables),
+  `oven-mllm-eval/analysis/extract_grpo_generation_examples.py` (examples).
 - Full reproduction recipe, including how to fold in trav08's final validation
   point when it completes, is in `viz/grpo/plot_commands.md`.
 
@@ -598,7 +598,7 @@ the reward … so inspect outputs"*), the generations were inspected
 - `viz/grpo/grpo_traversal_examples.md` — inspected generations (trained + base).
 - `viz/grpo/grpo_traversal_train_metrics.csv`, `grpo_elicit_trav_n8_metrics.csv` —
   tidy source data.
-- `oven-mllm-eval/scripts/plot_grpo_traversal.py` — figure + table generator.
+- `oven-mllm-eval/analysis/plot_grpo_traversal.py` — figure + table generator.
 
 ---
 

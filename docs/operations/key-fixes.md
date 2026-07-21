@@ -48,7 +48,7 @@
 3. `plot_pass_at_k.py` updated to glob `*_results*.json` patterns.
 4. `scoring.py` includes `judge_model` and `judge_mode` in the results JSON.
 
-**Code modified:** `scripts/schedule_sbatch.sh`, `scripts/schedule_scoring.sh`, `src/oven_mllm_eval/scoring.py`, `scripts/plot_pass_at_k.py`.
+**Code modified:** `scripts/schedule_sbatch.sh`, `scripts/schedule_scoring.sh`, `src/oven_mllm_eval/scoring.py`, `analysis/plot_pass_at_k.py`.
 
 ## 5. Global inference resume
 

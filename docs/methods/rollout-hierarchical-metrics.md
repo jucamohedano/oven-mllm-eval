@@ -211,4 +211,4 @@ proximity.
 - `src/oven_mllm_eval/embedding_matcher.py` — optional prediction-embedding cache for the
   larger unique set.
 - `scripts/score_predictions.py` — (optional) flag to restore single-prediction scoring.
-- `scripts/plot_pass_at_k.py` — overlay BoN hF on the pass@256 view.
+- `analysis/plot_pass_at_k.py` — overlay BoN hF on the pass@256 view.
