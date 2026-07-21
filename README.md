@@ -1,36 +1,110 @@
-# oven-mllm-eval
+<div align="center">
 
-Taxonomy-aware evaluation of multimodal LLMs on the OVEN dataset, using
-string matching and hierarchical precision/recall/F-score.
+<a href="https://www.python.org"><img alt="Python" src="https://img.shields.io/badge/Python_3.10--3.12-blue?logo=python&logoColor=white"></a>
+<a href="https://github.com/vllm-project/vllm"><img alt="vLLM" src="https://img.shields.io/badge/vLLM-offline_inference-ee4c2c"></a>
+<a href="https://www.unitn.it"><img alt="University of Trento" src="https://img.shields.io/badge/MSc_Thesis-University_of_Trento-4b44ce"></a>
+
+<h1>Taxonomy-Aware Evaluation of Multimodal LLMs</h1>
+
+Open-domain visual entity recognition on **OVEN**, measured with a specificity-preserving taxonomy.
+
+Juan Camacho Mohedano · University of Trento
+
+</div>
+
+______________________________________________________________________
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Pipeline](#pipeline)
+- [Setup](#setup)
+  - [Install](#install)
+  - [Data](#data)
+- [Usage](#usage)
+  - [Entrypoints](#entrypoints)
+  - [Running the pipeline](#running-the-pipeline)
+  - [Running on the cluster](#running-on-the-cluster)
+  - [Analysis and figures](#analysis-and-figures)
+- [Repository layout](#repository-layout)
+- [Documentation](#documentation)
+- [Citation](#citation)
+- [Acknowledgements](#acknowledgements)
+
+______________________________________________________________________
+
+## Overview
+
+Open-world classification is ill-posed: a Golden Retriever is correctly "animal", "dog",
+"retriever", or "Golden Retriever", yet flat accuracy picks one label and marks the rest
+wrong. This repository **measures** that ambiguity rather than optimising against it,
+evaluating Qwen3-VL (2B/4B/8B/32B) on OVEN with hierarchical metrics derived from the
+Wikidata **P279** ancestor chain.
+
+Three findings drive the design:
+
+1. **Models know more than they reliably say.** The correct entity is often present
+   somewhere in a large sample but seldom the first answer, i.e. a gap between *coverage*
+   (pass@k at large k) and *reliability* (pass@1).
+2. **The instruments are not neutral.** Under a permissive LM judge the 2B model appears
+   to cover more of the visual world than larger ones. Under a specificity-preserving
+   audit that advantage disappears and a clean bigger-is-better ordering returns.
+3. **Taxonomy-aware reasoning can be prompted for, not cheaply trained in.** Recursive
+   self-aggregation recombines existing knowledge without creating new correct answers,
+   and outcome-only GRPO mainly sharpens the format the prompt already produces.
+
+## Pipeline
+
+Three sequential phases, each a CLI reading and writing JSONL:
+
+1. **Inference** — `scripts/run_inference.py` draws N stochastic rollouts per example via
+   vLLM's offline `LLM.chat()` (no server). Writes `*_samples.jsonl`.
+2. **Judge** — `scripts/run_judge.py` has a text-only LM verify each rollout against the
+   ground truth, giving a binary verdict per rollout. Writes `*_judged.jsonl`.
+3. **Scoring** — `scripts/score_predictions.py` maps predictions onto the taxonomy and
+   computes hierarchical hP/hR/hF plus pass@k. Writes `*_scored.jsonl` + `*_results.json`.
+
+> **Two notions of "correct" coexist and the distinction carries weight.**
+> The **judge verdict** is permissive, free-form, and feeds pass@k. **Deterministic
+> taxonomy/string matching** feeds hF and the support audit. Never silently swap one for
+> the other.
+
+Runs are written to timestamped directories that never overwrite:
+
+```
+logs/schedule/oven_<method>_<prompt>/<model>/<YYYYMMDD_HHMMSS_RAND>/
+├── <run_id>_samples.jsonl    raw rollouts
+├── <run_id>_judged.jsonl     judge verdicts
+├── <run_id>_scored.jsonl     per-example metrics
+├── <run_id>_results.json     aggregate metrics
+└── *_metadata.json           per-phase config (model, sampling, judge, data)
+```
+
+______________________________________________________________________
 
 ## Setup
 
-### 1. Install (local dev environment)
+### Install
 
 ```bash
+git clone https://github.com/jucamohedano/oven-mllm-eval
 cd oven-mllm-eval
+
+curl -LsSf https://astral.sh/uv/install.sh | sh
 uv sync
 ```
 
-For building the taxonomy index (only needed once):
+Optional extras, installed as needed:
 
-```bash
-uv sync --extra build-index
-```
+| Extra | Purpose |
+| ----- | ------- |
+| `serve` | vLLM inference (cluster) |
+| `build-index` | networkx, only to rebuild the taxonomy index |
+| `analysis` | pandas/matplotlib/seaborn for plots |
+| `embed` | sentence-transformers for the `cascade` measure |
+| `dev` | pytest + ruff |
 
-For running inference with vLLM (on the cluster):
-
-```bash
-uv sync --extra serve
-```
-
-For analysis/plotting:
-
-```bash
-uv sync --extra analysis
-```
-
-### 2. Download OVEN data
+### Data
 
 ```bash
 # OVEN validation annotations
@@ -38,236 +112,143 @@ mkdir -p data/raw
 wget -P data/raw http://storage.googleapis.com/gresearch/open-vision-language/oven/oven_entity_val.jsonl
 wget -P data/raw http://storage.googleapis.com/gresearch/open-vision-language/ovenid2impath.csv
 
-# Prebuilt taxonomy chains (already included in the repo from vlm-eval)
-# data/raw/oven_wikidata_chains_cleaned_labels.jsonl
-
-# Alias file (from vlm-eval)
-# Copy from vlm-eval/src/vlmeval/calculate_scores/data_files/wikidata/wikidb_aka_oven_sample.jsonl
-# to data/raw/wikidb_aka_oven_sample.jsonl
-
-# Images (HuggingFace snapshot, ~tens of GB)
-huggingface-cli download ychenNLP/oven --repo-type dataset --local-dir data/images
+# Images (HuggingFace snapshot, tens of GB)
+hf download ychenNLP/oven --type dataset --local-dir data/images
 ```
 
-### 3. Prepare OVEN data
-
-Bridge the schema gap between raw OVEN downloads and what the evaluation
-pipeline expects:
+Then bridge the schema gap and build the taxonomy index:
 
 ```bash
 uv run python scripts/prepare_oven.py \
     --oven-val data/raw/oven_entity_val.jsonl \
     --id2path data/raw/ovenid2impath.csv \
     --image-root data/images \
-    --output data/processed/vlm_compatible_val.jsonl \
-    --exclude-inat
-```
+    --output data/processed/vlm_compatible_val.jsonl
 
-### 4. Build taxonomy index
-
-```bash
 uv run --extra build-index python scripts/build_taxonomy_index.py \
     --output data/processed/oven_taxonomy_index.json
 ```
 
-This produces a precomputed JSON index that can be loaded at runtime without
-networkx or datasets.
+`prepare_oven.py` accepts `--exclude-inat` to drop the iNaturalist2017 subset. The
+resulting `oven_taxonomy_index.json` holds the P279 chain per entity and is loaded at
+runtime by nearly everything, so scoring needs no networkx.
 
-## Running inference
+______________________________________________________________________
 
-All inference uses **stochastic sampling** (no greedy mode). Defaults mirror
-GRPO training settings: `temperature=1.0`, `top_p=1.0`, `top_k=-1`, `n=1`.
+## Usage
 
-Inference uses vLLM's offline `LLM.chat()` API — no separate server process.
-Images are passed as PIL objects directly (no base64 encoding). The `n`
-samples per request share the prefill KV cache, so the expensive vision
-encoding happens only once per example regardless of `n`.
+> **TL;DR**
+>
+> - Use `--help` on any script to explore its options.
+> - `scripts/` runs the pipeline. `analysis/` turns its outputs into figures and tables.
+> - Use `scripts/schedule_sbatch.sh` for the full GPU chain on Slurm.
 
-Three methods are supported:
-- **naive**: single sample per example (n=1)
-- **naive-sampling**: draw N samples per example, pick the best match
-- **iterative**: draw N samples per round for T rounds; if all fail,
-  optionally feed back failed attempts and retry (each round is one
-  batched `llm.chat()` call; prefix caching reuses the image KV across
-  rounds)
+### Entrypoints
 
-The `--max-pixels` flag (default `512×512 = 262144`) controls Qwen-VL's
-dynamic image resizing and is the single biggest throughput knob — lower
-values mean fewer vision tokens and faster prefill with minimal accuracy
-loss for image classification tasks.
+| Script | Purpose |
+| ------ | ------- |
+| `scripts/run_inference.py` | vLLM rollouts (`naive`, `naive-sampling`, `iterative`) |
+| `scripts/run_judge.py` | LM-as-judge verdict per rollout |
+| `scripts/score_predictions.py` | Taxonomy mapping, hP/hR/hF, pass@k |
+| `scripts/run_recursive_self_agg.py` | Recursive self-aggregation (N=16, K=4, T=5) |
+| `scripts/schedule_sbatch.sh` | Submit the inference → judge → scoring chain to Slurm |
+| `scripts/sync.sh` | rsync workspace to the cluster and pull results back |
 
-Output is automatically organised under `logs/schedule/` following the
-lmms-ocw convention.  Each run gets a **timestamped+randomised directory**
-so that repeated runs never overwrite each other:
+### Running the pipeline
 
-```
-logs/schedule/oven_<method>_<prompt>/<model>/<YYYYMMDD_HHMMSS_RAND>/
-├── <run_id>_samples.jsonl     raw predictions (from inference)
-├── <run_id>_scored.jsonl      per-sample outputs + metrics (from scoring)
-└── <run_id>_results.json      aggregate metrics (hP, hR, hF, exact)
-```
+All inference is **stochastic** (`temperature=1.0`, `top_p=1.0`, `top_k=-1`) to mirror GRPO
+sampling. `--max-pixels` controls Qwen-VL's dynamic resize and is the single biggest
+throughput knob.
 
 ```bash
-# Naive (1 sample)
+# N rollouts per example
 uv run --extra serve python scripts/run_inference.py \
     --input data/processed/vlm_compatible_val.jsonl \
-    --prompt-variant barebones --method naive
+    --prompt-variant concise_no_idk --method naive-sampling \
+    --samples-per-example 64 --max-pixels 262144
 
-# Naive stochastic sampling (n=64)
-uv run --extra serve python scripts/run_inference.py \
-    --input data/processed/vlm_compatible_val.jsonl \
-    --prompt-variant barebones --method naive-sampling \
-    --samples-per-example 64
-# Override temperature / top-p / top-k (defaults: 1.0 / 1.0 / -1)
-uv run --extra serve python scripts/run_inference.py \
-    --input data/processed/vlm_compatible_val.jsonl \
-    --method naive --temperature 0.7 --top-p 0.95
-
-# Tune image resolution — the biggest throughput knob
-uv run --extra serve python scripts/run_inference.py \
-    --input data/processed/vlm_compatible_val.jsonl \
-    --method naive-sampling --samples-per-example 64 \
-    --max-pixels 262144 --min-pixels 65536
-
-# Override the output directory
-uv run --extra serve python scripts/run_inference.py \
-    --input data/processed/vlm_compatible_val.jsonl \
-    --method naive --output-dir results/my_experiment
-```
-
-### Score results
-
-Scoring uses ``DirectMeasureMatcher`` (adapted from vlm-eval) with pluggable
-measures (``exact_match``, ``contained``, or ``all``).  Pass ``--output`` to
-preserve the raw predictions — otherwise the input file is overwritten in-place.
-
-```bash
-# Score with exact_match (default) — writes scored JSONL + aggregate results
+# score an existing run
 uv run python scripts/score_predictions.py \
-    --input logs/schedule/oven_naive_barebones/qwen_qwen3-vl-8b-instruct/20260525_111730_975668_samples.jsonl \
-    --output logs/schedule/oven_naive_barebones/qwen_qwen3-vl-8b-instruct/20260525_111730_975668/20260525_111730_975668_scored.jsonl \
-    --taxonomy-index data/processed/oven_taxonomy_index.json
-
-# Multiple measures, parallel scoring across CPU cores
-uv run python scripts/score_predictions.py \
-    --input results/my_experiment/samples.jsonl \
-    --output results/my_experiment/samples_scored.jsonl \
+    --input logs/schedule/.../<run_id>_samples.jsonl \
     --taxonomy-index data/processed/oven_taxonomy_index.json \
-    --measure exact_match contained \
-    --num-workers 8
+    --measure exact_match cascade --num-workers 8
 ```
 
-## Running on the cluster
+Prompt variants: `barebones`, `base_pretrained`, `concise`, `concise_no_idk`, `default`,
+`specific`, `vague`.
 
-### 1. Configure environment
-
-Copy the example env file and set your cluster paths:
-
-```bash
-cp .env.example .env
-# Edit .env — set HF_HOME to your scratch path, etc.
-```
-
-Edit `configs/sync.conf` to set your remote path, then:
+### Running on the cluster
 
 ```bash
-bash scripts/sync.sh
-```
+cp .env.example .env          # set HF_HOME to your scratch path
+vim configs/sync.conf         # set the remote path
+bash scripts/sync.sh          # push workspace, pull results
 
-### 2. Submit SLURM job
-
-**Option A:** Use the scheduler script (recommended — handles everything):
-
-```bash
 bash scripts/schedule_sbatch.sh \
-    -A <YOUR_ACCOUNT> \
-    -p boost_usr_prod \
-    -g 2 --tp 2 \
+    -A <ACCOUNT> -p boost_usr_prod -g 2 --tp 2 \
     --model Qwen/Qwen3-VL-8B-Instruct \
-    --method naive-sampling \
-    --prompt barebones \
-    --temperature 1.0 \
-    --samples-per-example 64 \
-    --max-examples 10 \
-    --max-model-len 8192
+    --method naive-sampling --prompt concise_no_idk \
+    --samples-per-example 64
 ```
 
-This runs inference via vLLM's offline `LLM.chat()` API and scores the results —
-all inside one SLURM job.  Results land under
-`logs/schedule/oven_<method>_<prompt>/<model>/<run_id>/` with three files:
-`<run_id>_samples.jsonl` (raw predictions), `<run_id>_scored.jsonl`
-(per-sample outputs + metrics), and `<run_id>_results.json` (aggregate).
+`scripts/schedule_scoring.sh` reruns judge + scoring for an existing run on the CPU tier.
 
-Run `bash scripts/schedule_sbatch.sh --help` for all options.
+### Analysis and figures
 
-**Option B:** Score an existing run on the free CPU tier (no GPU):
+Everything in `analysis/` consumes run artifacts and writes figures/tables into `viz/`:
 
 ```bash
-bash scripts/schedule_scoring.sh \
-    --input logs/schedule/oven_naive-sampling_barebones/qwen_qwen3-vl-4b-instruct/20260527_180244_074760/20260527_180244_074760_samples.jsonl \
-    --measure exact_match \
-    --num-workers 4
+uv run --extra analysis python analysis/plot_pass_at_k.py --help
+uv run --extra analysis python analysis/plot_hierarchical_metrics.py --help
+uv run streamlit run analysis/explore_judgments.py -- --scored <path>/<run_id>_scored.jsonl
 ```
 
-Run `bash scripts/schedule_scoring.sh --help` for all options.
+______________________________________________________________________
 
-### 3. Sync results back
+## Repository layout
 
-```bash
-bash scripts/sync.sh   # sync.sh also pulls remote logs/ and results/
+| Path | Contents |
+| ---- | -------- |
+| `scripts/` | Pipeline: inference, judge, scoring, data building, Slurm and sync helpers |
+| `analysis/` | Plotting, example rendering, and audits that consume run outputs |
+| `src/oven_mllm_eval/` | Library: taxonomy matching, measures, scoring, judge, pass@k |
+| `data/` | `raw/` downloads, `processed/` prepared JSONL + taxonomy index, `images/` |
+| `logs/schedule/` | Run outputs, one timestamped directory per run |
+| `viz/` | Generated figures and tables |
+| `docs/` | Methods, runbooks, findings, and research notes |
+
+The `scripts/` vs `analysis/` split is deliberate: `scripts/` produces the canonical run
+artifacts, `analysis/` only consumes them. The dependency runs one way, so analysis code
+never affects evaluation results.
+
+## Documentation
+
+`docs/README.md` is the index.
+
+| Directory | Content |
+| --------- | ------- |
+| `docs/methods/` | Pipeline and metric architecture (judge, cascade, hierarchical metrics) |
+| `docs/operations/` | Executable runbooks (RSA, scoring, training data, key fixes) |
+| `docs/findings/` | Empirical findings (prompt collapse, model diversity) |
+| `docs/thesis_notes/` | Numbered research log (`NNN-slug.md`), with its own index |
+| `docs/commands.md` | CLI and operational reference |
+
+______________________________________________________________________
+
+## Citation
+
+```bibtex
+@mastersthesis{camachomohedano2026taxonomy,
+  title  = {Taxonomy-Aware Evaluation of Multimodal LLMs on Open-Domain
+            Visual Entity Recognition},
+  author = {Camacho Mohedano, Juan},
+  school = {University of Trento},
+  year   = {2026}
+}
 ```
 
-## Prompt variants
+## Acknowledgements
 
-| Variant     | Description                                                         |
-|-------------|---------------------------------------------------------------------|
-| barebones   | Question + "Answer in the format 'A: <answer>.'"                    |
-| default     | Question + no extra text / no full sentence / best guess / A:        |
-| specific    | Question + "Be as specific as possible" + format instruction       |
-| vague       | Question + "Aim for a simple answer as if talking to a child"      |
-
-## Project structure
-
-```
-oven-mllm-eval/
-├── pyproject.toml              # uv project config (lightweight deps)
-├── configs/
-│   └── sync.conf               # remote cluster paths for rsync
-├── scripts/
-│   ├── prepare_oven.py         # bridge OVEN schema gap
-│   ├── build_taxonomy_index.py # precompute taxonomy lookup JSON
-│   ├── run_inference.py        # vLLM offline inference (naive/naive-sampling/iterative)
-│   ├── score_predictions.py    # score generation JSONL with hP/hR/hF
-│   ├── schedule_sbatch.sh      # schedule GPU inference + scoring SLURM job
-│   ├── schedule_scoring.sh     # schedule CPU-only scoring SLURM job
-│   ├── sync.sh                 # rsync to/from remote cluster
-│   └── visualize_taxonomy.py   # render taxonomy tree in browser
-├── src/oven_mllm_eval/
-│   ├── __init__.py
-│   ├── taxonomy.py             # load precomputed taxonomy index
-│   ├── matching.py             # multi-stage prediction → taxonomy node (TaxonomyMatcher)
-│   ├── measures.py             # DirectMeasureMatcher + pluggable measures (ExactMatch, Contained)
-│   ├── scoring.py              # score generation JSONL (multiprocess-capable)
-│   ├── scores.py               # calc_hierarchical_metrics, normalize (pure Python, from vlm-eval)
-│   ├── paths.py                # project-relative path constants (from vlm-eval)
-│   ├── prompts.py              # prompt construction for Qwen3-VL
-│   ├── io.py                   # JSONL I/O utilities
-│   └── data/
-│       ├── __init__.py
-│       └── load_data.py        # load_oven() (networkx only for index building)
-├── data/
-│   ├── raw/                    # downloaded OVEN data
-│   ├── processed/              # prepared JSONL + taxonomy index
-│   └── images/                 # OVEN images (not synced — download on cluster)
-├── splits/                     # OVEN train/val split files
-├── lib/                        # JS/CSS deps for visualization
-├── viz/                        # HTML taxonomy visualizations
-├── logs/
-│   ├── schedule/               # inference outputs (lmms-ocw convention)
-│   │   └── oven_<method>_<prompt>/<model>/<run_id>/
-│   │       ├── <run_id>_samples.jsonl
-│   │       ├── <run_id>_scored.jsonl
-│   │       └── <run_id>_results.json
-│   └── slurm/                  # SLURM job logs
-└── README.md
-```
+Built on [OVEN](https://open-vision-language.github.io/oven/) for the benchmark and on
+Snæbjarnarson et al. for the taxonomy-aware hierarchical measures (hP/hR/hF) that this
+evaluation adapts. The scoring and matching code started from the `vlm-eval` codebase.
