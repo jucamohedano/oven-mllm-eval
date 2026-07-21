@@ -79,6 +79,27 @@ def _row_rollout_records(row: dict) -> list[dict]:
     return [{"text": fallback, "count": 1, "indices": []}]
 
 
+def _scoring_worker_row(row: dict, idx: int) -> dict:
+    """Return only fields needed by direct-measure workers.
+
+    RSA solution rows can contain very large trace fields. Passing those full
+    rows through multiprocessing duplicates them in every worker and again in
+    the parent when results are returned. Workers only need the fields below to
+    score direct measures; the parent patches the returned metric fields back
+    into the original full rows.
+    """
+    return {
+        "__score_row_idx": idx,
+        "answer": row.get("answer", ""),
+        "entity_id": row.get("entity_id"),
+        "all_texts": row.get("all_texts"),
+        "judge_selected_text": row.get("judge_selected_text"),
+        "prediction": row.get("prediction"),
+        "iter_final_prediction": row.get("iter_final_prediction"),
+        "output": row.get("output"),
+    }
+
+
 def _add_mapping_coverage_metrics(
     metrics: dict,
     *,
@@ -151,14 +172,21 @@ def _score_rows(
     from oven_mllm_eval.taxonomy import load_taxonomy_index
     from oven_mllm_eval.measures import ALL_MEASURES, DirectMeasureMatcher
 
+    worker_pid = os.getpid()
+    print(
+        f"[scoring:{worker_pid}] loading taxonomy and initializing {measure_names} "
+        f"for {len(rows):,} rows",
+        flush=True,
+    )
     index = load_taxonomy_index(taxonomy_index_path)
     matchers = {m: DirectMeasureMatcher(index, ALL_MEASURES[m]) for m in measure_names}
+    print(f"[scoring:{worker_pid}] initialized matchers; scoring rows", flush=True)
 
     accum = {m: _new_accum() for m in measure_names}
     scored_rows = []
 
     total = len(rows)
-    report_every = max(1, min(1000, total // 10))  # ~10 updates per chunk
+    report_every = max(1, min(250, total // 20))  # frequent enough to show worker liveness
     for i, row in enumerate(rows):
         answer = (row.get("answer", "")
                   .replace("A: ", "").replace("A:", "")
@@ -179,7 +207,7 @@ def _score_rows(
             if ref_path is not None:
                 break
 
-        scored_row = {**row}
+        scored_row = {"__score_row_idx": row.get("__score_row_idx")}
         for matcher_name, matcher in matchers.items():
             # Best of the deduped rollout texts by original hF for this
             # measure. Also keep a separate best candidate under the
@@ -264,7 +292,7 @@ def _score_rows(
 
         if (i + 1) % report_every == 0 or i == total - 1:
             pct = (i + 1) / total * 100
-            print(f"[scoring] {i + 1}/{total} ({pct:.1f}%)", flush=True)
+            print(f"[scoring:{worker_pid}] {i + 1:,}/{total:,} ({pct:.1f}%)", flush=True)
 
     return scored_rows, accum
 
@@ -563,16 +591,20 @@ def score_generation_file(
     accum = {m: _new_accum() for m in lexical_names}
     if lexical_names:
         print(f"[score] scoring lexical/direct measures: {lexical_names}", flush=True)
+        worker_rows = [_scoring_worker_row(row, idx) for idx, row in enumerate(rows)]
         if num_workers > 1:
             # Contiguous chunks of roughly equal size.  All rows do the same
             # work (one prediction vs ~12K node labels), so round-robin isn't
             # needed — and contiguous chunks preserve row order in output.
-            chunk_size = (len(rows) + num_workers - 1) // num_workers
-            chunks = [rows[i:i + chunk_size] for i in range(0, len(rows), chunk_size)]
+            chunk_size = (len(worker_rows) + num_workers - 1) // num_workers
+            chunks = [
+                worker_rows[i:i + chunk_size]
+                for i in range(0, len(worker_rows), chunk_size)
+            ]
             args = [(chunk, lexical_names, resolved_index_path) for chunk in chunks]
             print(
                 f"[score] launched {len(chunks)} scoring chunks "
-                f"(chunk_size~{chunk_size:,})",
+                f"(chunk_size~{chunk_size:,}; lean worker rows)",
                 flush=True,
             )
 
@@ -584,14 +616,20 @@ def score_generation_file(
                     "multiprocessing.Pool.map failed — falling back to serial. "
                     "Error details:", exc_info=True,
                 )
-                results = [_score_rows((rows, lexical_names, resolved_index_path))]
+                results = [_score_rows((worker_rows, lexical_names, resolved_index_path))]
         else:
-            results = [_score_rows((rows, lexical_names, resolved_index_path))]
+            results = [_score_rows((worker_rows, lexical_names, resolved_index_path))]
 
         print("[score] merging scored chunks and accumulators", flush=True)
-        scored_rows = []
+        scored_rows = rows
+        merged_updates = 0
         for chunk_rows, chunk_accum in results:
-            scored_rows.extend(chunk_rows)
+            for scored_update in chunk_rows:
+                row_idx = scored_update.pop("__score_row_idx", None)
+                if row_idx is None:
+                    continue
+                scored_rows[row_idx].update(scored_update)
+                merged_updates += 1
             for m in lexical_names:
                 for key in (
                     "hP", "hR", "hF", "exact",
@@ -601,9 +639,9 @@ def score_generation_file(
                     accum[m][key].extend(chunk_accum[m][key])
                 accum[m]["mapped"] += chunk_accum[m]["mapped"]
                 accum[m]["specific_mapped"] += chunk_accum[m]["specific_mapped"]
-        print(f"[score] merged {len(scored_rows):,} scored rows", flush=True)
+        print(f"[score] merged {merged_updates:,} scored row updates", flush=True)
     else:
-        scored_rows = [dict(r) for r in rows]
+        scored_rows = rows
         print("[score] no lexical/direct measures requested", flush=True)
 
     # Score the embedding measure (cosine retrieval → cascade), single pass.

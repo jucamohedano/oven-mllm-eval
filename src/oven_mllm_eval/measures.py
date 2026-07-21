@@ -264,12 +264,93 @@ class DirectMeasureMatcher:
         self.node_to_path: dict = index.get("node_to_path", {})
         self.measure = measure
         self.top_k = top_k
+        self._exact_match_enabled = self.measure.get("name") == "exact_match"
+        self._exact_processed_refs: list[str] | None = None
+        self._exact_ref_keys: set[str] = set()
+        self._exact_top_idxs_cache: dict[str, np.ndarray] = {}
+        self._exact_zero_top_idxs: np.ndarray | None = None
+        if self._exact_match_enabled and self.all_nodes:
+            self._prepare_exact_match_cache()
+
+    def _prepare_exact_match_cache(self) -> None:
+        measure_params = self.measure.get("params", {}).copy()
+        references = list(self.all_nodes)
+        if measure_params.pop("stem", False):
+            references = _stem_texts(references)
+        self._exact_processed_refs = references
+        self._exact_ref_keys = set(references)
+        actual_top_k = min(self.top_k, len(references))
+        self._exact_zero_top_idxs = np.argsort(np.zeros(len(references)))[-actual_top_k:][::-1]
+
+    def _preprocess_exact_prediction(self, prediction: str) -> str:
+        measure_params = self.measure.get("params", {}).copy()
+        if measure_params.pop("stem", False):
+            return _stem_texts([prediction])[0]
+        return prediction
+
+    def _exact_top_idxs_for_key(self, prediction_key: str) -> np.ndarray:
+        if prediction_key in self._exact_top_idxs_cache:
+            return self._exact_top_idxs_cache[prediction_key]
+
+        if self._exact_processed_refs is None or self._exact_zero_top_idxs is None:
+            raise RuntimeError("Exact-match cache was not initialized.")
+
+        if prediction_key not in self._exact_ref_keys:
+            top_k_idxs = self._exact_zero_top_idxs
+        else:
+            all_scores = np.fromiter(
+                (1.0 if ref == prediction_key else 0.0 for ref in self._exact_processed_refs),
+                dtype=float,
+                count=len(self._exact_processed_refs),
+            )
+            actual_top_k = min(self.top_k, len(all_scores))
+            # Preserve vlm-eval's direct-measure tie behavior exactly.
+            top_k_idxs = np.argsort(all_scores)[-actual_top_k:][::-1]
+
+        self._exact_top_idxs_cache[prediction_key] = top_k_idxs
+        return top_k_idxs
+
+    def _match_exact_fast(self, prediction: str) -> dict | None:
+        if self._exact_processed_refs is None:
+            return None
+
+        prediction_key = self._preprocess_exact_prediction(prediction)
+        top_k_idxs = self._exact_top_idxs_for_key(prediction_key)
+        best_idx = int(top_k_idxs[0])
+        best_node = self.all_nodes[best_idx]
+        best_path = self.node_to_path.get(best_node)
+
+        def score_at(idx: int) -> float:
+            return 1.0 if self._exact_processed_refs[idx] == prediction_key else 0.0
+
+        best_score = score_at(best_idx)
+        top_k_candidates = [
+            {
+                "name": self.all_nodes[int(idx)],
+                "path": self.node_to_path.get(self.all_nodes[int(idx)]),
+                "score": score_at(int(idx)),
+            }
+            for idx in top_k_idxs
+        ]
+
+        return {
+            "predicted_node": best_node,
+            "predicted_path": best_path,
+            "mapping_method": self.measure.get("name", "direct_measure"),
+            "scores": {
+                "score": best_score,
+                "top_k_candidates": top_k_candidates,
+            },
+        }
 
     def match(self, prediction: str) -> dict | None:
         if not self.all_nodes:
             return None
 
         prediction = _clean_prediction(prediction)
+        if self._exact_match_enabled:
+            return self._match_exact_fast(prediction)
+
         references = list(self.all_nodes)
         measure_params = self.measure.get("params", {}).copy()
 

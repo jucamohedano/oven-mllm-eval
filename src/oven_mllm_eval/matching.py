@@ -27,6 +27,8 @@ import re
 from collections import defaultdict
 from typing import Callable, Optional
 
+import numpy as np
+
 from oven_mllm_eval.scores import calc_hierarchical_metrics, normalize as _scores_normalize
 
 
@@ -115,29 +117,23 @@ class TaxonomyMatcher:
         ``ngram_overlap_similarity`` (bigram Jaccard), which provides
         meaningful ordering without requiring CLIP or other models.
     k : int
-        Number of top-scoring nodes to consider (default 3, from the
-        paper's OVEN hyper-parameters).
+        Number of top-scoring nodes to consider.
     thr_topk : float
-        Max softmax difference between top-1 and top-k for voting (default 0.005).
+        Max softmax difference between top-1 and top-k for voting.
     thr_top2 : float
-        Max softmax difference between top-1 and top-2 for voting (default 0.001).
+        Max softmax difference between top-1 and top-2 for voting.
     thr_vote : int
-        Min votes for a common ancestor to be selected (default 2).
-    min_score : float, optional
-        Retrieval-score floor for the embedding path.  When set, a prediction
-        with no lexical hit whose best top-k score is below this maps to None
-        (``mapping_method="none"``).  Default None (no floor; lexical path).
+        Min votes for a common ancestor to be selected.
     """
 
     def __init__(
         self,
         index: dict,
         similarity_fn: Callable[[str, str], float] | None = None,
-        k: int = 3,
-        thr_topk: float = 0.005,
+        k: int = 10,
+        thr_topk: float = 0.0015,
         thr_top2: float = 0.001,
-        thr_vote: int = 2,
-        min_score: float | None = None,
+        thr_vote: int = 4,
     ):
         self.index = index
         self.node_to_path = index.get("node_to_path", {})
@@ -150,9 +146,6 @@ class TaxonomyMatcher:
         self.thr_topk = thr_topk
         self.thr_top2 = thr_top2
         self.thr_vote = thr_vote
-        # When set (embedding path), a prediction whose best retrieval score is
-        # below this floor and has no lexical hit maps to None ("none" method).
-        self.min_score = min_score
 
         # Pre-normalise all node labels for faster scoring
         self._norm_labels: list[str] = [_normalise(n) for n in self.all_nodes]
@@ -179,8 +172,8 @@ class TaxonomyMatcher:
         """Map a free-text prediction to a taxonomy node.
 
         Returns None only if the taxonomy has no nodes (should never happen
-        with OVEN).  The algorithm always produces a node via the fallback,
-        unless ``min_score`` gates it to the ``"none"`` method.
+        with OVEN). The algorithm always produces a taxonomy node via the
+        top-score fallback.
 
         Parameters
         ----------
@@ -200,20 +193,15 @@ class TaxonomyMatcher:
         #   cosine top-k.  Everything after is the shared, reference-faithful
         #   cascade (exact-equality → n-gram → voting → top-score).
         if top_idxs is None:
-            #   Lexical: score all nodes, sort, take top-k.
-            #   Equivalent: S = [(m(pred, v.label), v) for v in T]
-            scores = [self._similarity_fn(norm_pred, nl) for nl in self._norm_labels]
-            # Argsort descending to preserve the original paper's ordering of
-            # equal-scored nodes (stable sort → later equal nodes don't swap).
-            ranked = sorted(range(len(scores)), key=lambda i: -scores[i])
-            k = min(self.k, len(ranked))
-            top_idxs = ranked[:k]
-            top_scores = [scores[i] for i in top_idxs]
-            all_order = ranked
+            scores = np.asarray([self._similarity_fn(norm_pred, nl) for nl in self._norm_labels], dtype=float)
+            k = min(self.k, len(scores))
+            top_idxs = np.argsort(scores)[-k:].tolist()
+            top_scores = scores[top_idxs].tolist()
+            all_order = range(len(self.all_nodes))
         else:
-            #   Embedding: top-k already retrieved.  The all-node n-gram stage
-            #   selects by depth, not score, so iteration order is irrelevant —
-            #   use the original node order.
+            pairs = sorted(zip(top_idxs, top_scores), key=lambda pair: pair[1])
+            top_idxs = [idx for idx, _ in pairs]
+            top_scores = [score for _, score in pairs]
             all_order = range(len(self.all_nodes))
 
         top_nodes = [self.all_nodes[i] for i in top_idxs]
@@ -234,7 +222,7 @@ class TaxonomyMatcher:
         #   All-nodes: a pred n-gram must equal a FULL node label (reference
         #   n_gram_variants=False) — stricter, so a multi-word node can't be
         #   hijacked by one shared word ("of the", or "a" from "España").
-        for n in (4, 3, 2, 1):
+        for n in (4, 3, 2):
             pred_ngrams = _get_n_grams(norm_pred, n)
             if not pred_ngrams:
                 continue
@@ -249,18 +237,14 @@ class TaxonomyMatcher:
             if cand is not None:
                 return self._make_result(cand, f"ngram_match_{n}")
 
-        # --- NONE-floor: weak retrieval and no lexical hit ----------------
-        if self.min_score is not None and (not top_scores or max(top_scores) < self.min_score):
-            return {"predicted_node": None, "predicted_path": None, "mapping_method": "none"}
-
         # --- Step 4: voting — if top-k scores are ambiguous ---------------
-        if len(s_k) >= 2 and (s_k[0] - s_k[1] < self.thr_top2) and (s_k[0] - s_k[-1] < self.thr_topk):
+        if len(s_k) >= 2 and (s_k[-1] - s_k[-2] < self.thr_top2) and ((s_k[-1] - s_k[0]) / len(s_k) < self.thr_topk):
             cand = self._voting_fallback(top_nodes)
             if cand is not None:
                 return self._make_result(cand, "voting")
 
         # --- Step 5: top-score fallback -----------------------------------
-        return self._make_result(top_nodes[0], "top_score")
+        return self._make_result(top_nodes[-1], "top_score")
 
     def evaluate(
         self,
@@ -359,49 +343,26 @@ class TaxonomyMatcher:
     # ------------------------------------------------------------------
 
     def _exact_in_topk(self, norm_pred: str, norm_labels: list[str], original_labels: list[str]) -> str | None:
-        """Return the most specific top-k node whose label exactly equals norm_pred.
-
-        Reference-faithful in-top-k check (``check_topks`` in the CVPR code).
-        """
-        best_node = None
-        best_depth = -1
+        """Return the first top-k node whose label exactly equals norm_pred."""
         for norm_label, original in zip(norm_labels, original_labels):
             if norm_label and norm_label == norm_pred:
-                depth = len(self.node_to_path.get(original, []))
-                if depth > best_depth:
-                    best_depth = depth
-                    best_node = original
-        return best_node
+                return original
+        return None
 
     def _fulllabel_ngram_check(self, pred_ngrams: set[str], norm_labels: list[str], original_labels: list[str]) -> str | None:
-        """Most specific node whose full label equals one of the prediction's n-grams.
-
-        Reference n_gram_variants=False (all-nodes stage): a prediction n-gram
-        must match a whole node label, so a multi-word node cannot be hijacked
-        by a single shared word.
-        """
-        best_node = None
-        best_depth = -1
+        """Return the first node whose full label equals a prediction n-gram."""
         for norm_label, original in zip(norm_labels, original_labels):
             if norm_label and norm_label in pred_ngrams:
-                depth = len(self.node_to_path.get(original, []))
-                if depth > best_depth:
-                    best_depth = depth
-                    best_node = original
-        return best_node
+                return original
+        return None
 
     def _ngram_check(self, pred_ngrams: set[str], norm_labels: list[str], original_labels: list[str], n: int) -> str | None:
-        """Return the most specific node whose n-grams overlap with pred_ngrams."""
-        best_node = None
-        best_depth = -1
+        """Return the first node whose n-grams overlap with pred_ngrams."""
         for norm_label, original in zip(norm_labels, original_labels):
             node_ngrams = _get_n_grams(norm_label, n)
             if pred_ngrams & node_ngrams:
-                depth = len(self.node_to_path.get(original, []))
-                if depth > best_depth:
-                    best_depth = depth
-                    best_node = original
-        return best_node
+                return original
+        return None
 
     def _voting_fallback(self, top_nodes: list[str]) -> str | None:
         """Most specific common ancestor among top-k nodes with >= thr_vote votes.
@@ -420,7 +381,7 @@ class TaxonomyMatcher:
         # Deepest (highest i) first
         for i in sorted(votes.keys(), reverse=True):
             node, count = max(votes[i].items(), key=lambda x: x[1])
-            if count > self.thr_vote:
+            if count >= self.thr_vote:
                 return node
         return None
 

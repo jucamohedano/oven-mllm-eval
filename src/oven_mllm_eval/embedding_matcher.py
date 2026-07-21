@@ -5,12 +5,14 @@ from __future__ import annotations
 import hashlib
 import os
 from pathlib import Path
+from typing import Iterator
 
 import numpy as np
 
 DEFAULT_BACKEND = "open_clip"
 DEFAULT_MODEL = "hf-hub:apple/DFN5B-CLIP-ViT-H-14"
 DEFAULT_CACHE_DIR = "data/processed/node_emb"
+DEFAULT_SEARCH_CHUNK_SIZE = 4096
 
 
 class EmbeddingNodeIndex:
@@ -66,15 +68,27 @@ class EmbeddingNodeIndex:
 
         raise ValueError(f"Unknown embedding backend '{self.backend}'.")
 
-    def _encode_texts(self, texts: list[str]) -> np.ndarray:
+    def _encode_texts(
+        self,
+        texts: list[str],
+        *,
+        label: str = "texts",
+        quiet: bool = False,
+    ) -> np.ndarray:
         model, tokenizer = self._load_model()
         if self.backend == "sentence_transformer":
+            if not quiet:
+                print(
+                    f"[embed] encoding {len(texts):,} {label} with "
+                    f"{self.backend}:{self.model_name} on {self.device}",
+                    flush=True,
+                )
             return model.encode(
                 texts,
                 batch_size=256,
                 normalize_embeddings=True,
                 convert_to_numpy=True,
-                show_progress_bar=True,
+                show_progress_bar=not quiet,
             )
 
         import torch
@@ -84,11 +98,12 @@ class EmbeddingNodeIndex:
         total = len(texts)
         num_batches = (total + batch_size - 1) // batch_size if total else 0
         report_every = max(1, num_batches // 10) if num_batches else 1
-        print(
-            f"[embed] encoding {total:,} texts with {self.backend}:{self.model_name} "
-            f"on {self.device} (batch_size={batch_size})",
-            flush=True,
-        )
+        if not quiet:
+            print(
+                f"[embed] encoding {total:,} {label} with {self.backend}:{self.model_name} "
+                f"on {self.device} (batch_size={batch_size})",
+                flush=True,
+            )
         for start in range(0, len(texts), batch_size):
             batch = texts[start:start + batch_size]
             with torch.no_grad():
@@ -97,10 +112,10 @@ class EmbeddingNodeIndex:
                 feats = feats / feats.norm(dim=-1, keepdim=True)
                 outputs.append(feats.cpu().numpy())
             batch_idx = start // batch_size + 1
-            if batch_idx % report_every == 0 or batch_idx == num_batches:
+            if not quiet and (batch_idx % report_every == 0 or batch_idx == num_batches):
                 print(
                     f"[embed] encoded batch {batch_idx}/{num_batches} "
-                    f"({min(start + batch_size, total):,}/{total:,} texts)",
+                    f"({min(start + batch_size, total):,}/{total:,} {label})",
                     flush=True,
                 )
         return np.concatenate(outputs, axis=0) if outputs else np.zeros((0, 1), dtype=np.float32)
@@ -124,7 +139,7 @@ class EmbeddingNodeIndex:
             f"(one-time, caching to {cp})",
             flush=True,
         )
-        emb = self._encode_texts(self.all_nodes)
+        emb = self._encode_texts(self.all_nodes, label="taxonomy nodes")
         try:
             cp.parent.mkdir(parents=True, exist_ok=True)
             tmp = cp.parent / (cp.name + ".tmp")
@@ -138,26 +153,88 @@ class EmbeddingNodeIndex:
             )
         return emb
 
-    def search(self, predictions: list[str], k: int = 10) -> list[tuple[list[int], list[float]]]:
-        print(
-            f"[embed] searching {len(predictions):,} unique predictions against "
-            f"{len(self.all_nodes):,} taxonomy nodes (top_k={k})",
-            flush=True,
-        )
-        pred_emb = self._encode_texts(list(predictions))
-        print("[embed] computing prediction-node similarity matrix", flush=True)
-        scores = pred_emb @ self.node_emb.T
-        print("[embed] extracting top-k taxonomy candidates", flush=True)
-        out: list[tuple[list[int], list[float]]] = []
-        total = len(scores)
-        report_every = max(1, min(10000, total // 10)) if total else 1
+    def _search_chunk_size(self) -> int:
+        raw = os.environ.get("OVEN_EMBED_SEARCH_CHUNK_SIZE")
+        if raw:
+            try:
+                return max(1, int(raw))
+            except ValueError:
+                print(
+                    f"[embed] WARNING: invalid OVEN_EMBED_SEARCH_CHUNK_SIZE={raw!r}; "
+                    f"using {DEFAULT_SEARCH_CHUNK_SIZE}",
+                    flush=True,
+                )
+        return DEFAULT_SEARCH_CHUNK_SIZE
+
+    @staticmethod
+    def _topk_from_scores(scores: np.ndarray, k: int) -> Iterator[tuple[list[int], list[float]]]:
         for row in scores:
             top_k = min(k, len(row))
+            if top_k <= 0:
+                yield [], []
+                continue
             candidate_idxs = np.argpartition(row, -top_k)[-top_k:]
             idxs = candidate_idxs[np.argsort(row[candidate_idxs])[::-1]]
-            out.append((idxs.tolist(), [float(row[idx]) for idx in idxs]))
-            if len(out) % report_every == 0 or len(out) == total:
-                print(f"[embed] top-k extracted for {len(out):,}/{total:,} predictions", flush=True)
+            yield idxs.tolist(), [float(row[idx]) for idx in idxs]
+
+    def iter_search(
+        self,
+        predictions: list[str],
+        k: int = 10,
+        *,
+        chunk_size: int | None = None,
+    ) -> Iterator[tuple[str, list[int], list[float]]]:
+        """Yield top-k node hits without materializing the full score matrix."""
+        total = len(predictions)
+        chunk_size = chunk_size or self._search_chunk_size()
+        print(
+            f"[embed] searching {total:,} unique predictions against "
+            f"{len(self.all_nodes):,} taxonomy nodes (top_k={k}, search_chunk_size={chunk_size:,})",
+            flush=True,
+        )
+        if not predictions:
+            return
+
+        node_emb_t = self.node_emb.T
+        num_chunks = (total + chunk_size - 1) // chunk_size
+        report_every = max(1, total // 10)
+        processed = 0
+        next_report = report_every
+        for chunk_idx, chunk_start in enumerate(range(0, total, chunk_size), start=1):
+            chunk = predictions[chunk_start:chunk_start + chunk_size]
+            chunk_end = chunk_start + len(chunk)
+            score_block_mib = (
+                len(chunk) * len(self.all_nodes) * np.dtype(np.float32).itemsize / (1024 ** 2)
+            )
+            print(
+                f"[embed] chunk {chunk_idx:,}/{num_chunks:,}: predictions "
+                f"{chunk_start + 1:,}-{chunk_end:,} "
+                f"(score_block~{score_block_mib:.1f} MiB)",
+                flush=True,
+            )
+            pred_emb = self._encode_texts(chunk, label="prediction chunk", quiet=True)
+            scores = pred_emb @ node_emb_t
+            for pred, (idxs, row_scores) in zip(chunk, self._topk_from_scores(scores, k)):
+                yield pred, idxs, row_scores
+
+            processed += len(chunk)
+            print(
+                f"[embed] chunk {chunk_idx:,}/{num_chunks:,} done; "
+                f"searched top-k for {processed:,}/{total:,} predictions",
+                flush=True,
+            )
+            if processed >= next_report or processed == total:
+                print(
+                    f"[embed] searched top-k for {processed:,}/{total:,} predictions",
+                    flush=True,
+                )
+                while next_report <= processed:
+                    next_report += report_every
+
+    def search(self, predictions: list[str], k: int = 10) -> list[tuple[list[int], list[float]]]:
+        out: list[tuple[list[int], list[float]]] = []
+        for _pred, idxs, row_scores in self.iter_search(predictions, k=k):
+            out.append((idxs, row_scores))
         return out
 
 
@@ -181,13 +258,12 @@ def build_prediction_mapping(
         cache_dir=cache_dir,
         device=device,
     )
-    hits = node_index.search(uniq, k=k)
     matcher = TaxonomyMatcher(index, k=k)
 
     mapping: dict[str, dict] = {}
     print(f"[cascade] mapping {len(uniq):,} unique predictions with taxonomy cascade", flush=True)
     report_every = max(1, min(10000, len(uniq) // 10)) if uniq else 1
-    for pred, (idxs, row_scores) in zip(uniq, hits):
+    for pred, idxs, row_scores in node_index.iter_search(uniq, k=k):
         mapping[pred] = matcher.match_prediction(pred, top_idxs=idxs, top_scores=row_scores)
         if len(mapping) % report_every == 0 or len(mapping) == len(uniq):
             print(f"[cascade] mapped {len(mapping):,}/{len(uniq):,} unique predictions", flush=True)

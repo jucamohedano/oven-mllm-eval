@@ -50,14 +50,13 @@ def main():
                         help="Number of worker processes for parallel scoring. "
                              "0 = auto (all available CPUs via sched_getaffinity). "
                              "Each worker loads its own copy of the taxonomy index.")
+    parser.add_argument("--embed-backend", default="open_clip",
+                        help="Cascade retrieval backend: open_clip (default) or sentence_transformer.")
     parser.add_argument("--embed-model",
-                        default="sentence-transformers/all-mpnet-base-v2",
-                        help="Sentence-embedding model for the 'cascade' measure's top-k retrieval.")
-    parser.add_argument("--map-top-k", type=int, default=3,
-                        help="Top-k taxonomy nodes retrieved by cosine (default: 3).")
-    parser.add_argument("--map-min-score", type=float, default=0.35,
-                        help="Cosine NONE-floor: below this with no lexical hit → "
-                             "unmapped (default: 0.35).")
+                        default="hf-hub:apple/DFN5B-CLIP-ViT-H-14",
+                        help="Embedding model for the 'cascade' measure's top-k retrieval.")
+    parser.add_argument("--map-top-k", type=int, default=10,
+                        help="Top-k taxonomy nodes retrieved by cosine (default: 10).")
     parser.add_argument("--embed-device", default="cpu",
                         help="Device for embedding ('cpu' or 'cuda'). Default: cpu.")
     parser.add_argument("--max-examples", type=int, default=None,
@@ -83,8 +82,8 @@ def main():
             measure=args.measure,
             num_workers=args.num_workers,
             embed_model=args.embed_model,
+            embed_backend=args.embed_backend,
             map_top_k=args.map_top_k,
-            map_min_score=args.map_min_score,
             embed_device=args.embed_device,
             max_examples=args.max_examples,
         )
