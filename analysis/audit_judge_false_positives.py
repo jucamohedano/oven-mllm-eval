@@ -11,7 +11,9 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 import statistics
+import sys
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -165,6 +167,122 @@ def format_percent(value: Any) -> str:
     return f"{float(value):.1f}%"
 
 
+def tex_escape(text: str) -> str:
+    return (
+        text.replace("\\", r"\textbackslash{}")
+        .replace("&", r"\&")
+        .replace("%", r"\%")
+        .replace("$", r"\$")
+        .replace("#", r"\#")
+        .replace("_", r"\_")
+        .replace("{", r"\{")
+        .replace("}", r"\}")
+    )
+
+
+def infer_judge_label(scored_paths: list[Path]) -> tuple[str, str]:
+    joined = "\n".join(path.name for path in scored_paths).lower()
+    if "google_gemma-4-e4b-it_with_desc_rich" in joined:
+        return "Gemma-4-E4B", "google_gemma-4-e4b-it_with_desc_rich"
+    if "qwen_qwen3-4b_with_desc_rich" in joined:
+        return "Qwen3-4B", "qwen_qwen3-4b_with_desc_rich"
+    if "google_gemma" in joined:
+        return "Gemma", "google_gemma"
+    if "qwen_qwen3" in joined:
+        return "Qwen3", "qwen_qwen3"
+    return "Judge", "judge"
+
+
+def infer_experiment_prefix(scored_paths: list[Path]) -> str:
+    joined = "\n".join(path.name for path in scored_paths).lower()
+    if "rsa_solution_n16_k4_t5" in joined:
+        return "rsa_solution_n16_k4_t5"
+    return "standard_sampling"
+
+
+def default_latex_table_path(scored_paths: list[Path]) -> Path:
+    _, judge_slug = infer_judge_label(scored_paths)
+    prefix = infer_experiment_prefix(scored_paths)
+    return Path("viz/judge_audit") / f"{prefix}_{judge_slug}_audit_table.tex"
+
+
+def sanitize_latex_label(label: str) -> str:
+    return re.sub(r"[^A-Za-z0-9:.-]+", "-", label.strip())
+
+
+def latex_model_label(run: str) -> str:
+    if re.fullmatch(r"\d+B", run):
+        return f"Qwen3-VL {run}"
+    return run
+
+
+def latex_audit_table(
+    summaries: list[dict[str, Any]],
+    *,
+    scored_paths: list[Path],
+    caption: str | None,
+    label: str | None,
+) -> str:
+    judge_label, judge_slug = infer_judge_label(scored_paths)
+    if caption is None:
+        caption = (
+            f"Mechanical support audit of {judge_label} judge-positive rollouts for "
+            "standard sampling with rich descriptions. Supported positives are "
+            "judge-positive rollouts verified by exact match, alias match, or "
+            "answer/alias containment."
+        )
+    if label is None:
+        label = sanitize_latex_label(f"tab:judge-positive-support-audit-{judge_slug}")
+
+    order = {"2B": 0, "4B": 1, "8B": 2, "32B": 3}
+    sorted_summaries = sorted(summaries, key=lambda row: order.get(str(row["run"]), 99))
+    lines = [
+        r"% Requires \usepackage{booktabs}",
+        r"\begin{table}[t]",
+        r"\centering",
+        r"\small",
+        rf"\caption{{{tex_escape(caption)}}}",
+        rf"\label{{{label}}}",
+        r"\begin{tabular}{llrrrrrr}",
+        r"\toprule",
+        r"Judge & Model & Judge p@1 & Supported p@1 & Judge p@256 & Supported p@256 & Supported/Judge & Under-specific/Judge \\",
+        r"\midrule",
+    ]
+    for summary in sorted_summaries:
+        lines.append(
+            f"{tex_escape(judge_label)} & {tex_escape(latex_model_label(str(summary['run'])))} "
+            f"& {float(summary['judge_pass@1']):.3f} "
+            f"& {float(summary['supported_pass@1']):.3f} "
+            f"& {float(summary['judge_pass@k']):.3f} "
+            f"& {float(summary['supported_pass@k']):.3f} "
+            f"& {float(summary['supported_positive_%']):.1f}\\% "
+            f"& {float(summary['under_specific_%']):.1f}\\% \\\\"
+        )
+    lines.extend([r"\bottomrule", r"\end{tabular}", r"\end{table}", ""])
+    return "\n".join(lines)
+
+
+def write_latex_table(
+    summaries: list[dict[str, Any]],
+    *,
+    scored_paths: list[Path],
+    output: str,
+    caption: str | None,
+    label: str | None,
+) -> Path:
+    out_path = default_latex_table_path(scored_paths) if output == "auto" else Path(output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(
+        latex_audit_table(
+            summaries,
+            scored_paths=scored_paths,
+            caption=caption,
+            label=label,
+        )
+    )
+    return out_path
+
+
 def print_compact_table(summaries: list[dict[str, Any]], *, details: bool) -> None:
     columns = [
         ("run", "Run", str),
@@ -241,6 +359,31 @@ def main() -> None:
         action="store_true",
         help="Include exact/alias/containment support breakdown columns in the compact table.",
     )
+    parser.add_argument(
+        "--latex-table",
+        nargs="?",
+        default="auto",
+        const="auto",
+        help=(
+            "Write a LaTeX table. Defaults to an auto-named file in viz/judge_audit/. "
+            "Pass a path to override."
+        ),
+    )
+    parser.add_argument(
+        "--no-latex-table",
+        action="store_true",
+        help="Disable the default LaTeX table output.",
+    )
+    parser.add_argument(
+        "--latex-caption",
+        default=None,
+        help="Caption for the LaTeX table.",
+    )
+    parser.add_argument(
+        "--latex-label",
+        default=None,
+        help="Label for the LaTeX table.",
+    )
     args = parser.parse_args()
 
     index = json.loads(Path(args.taxonomy_index).read_text())
@@ -255,6 +398,16 @@ def main() -> None:
         )
         for scored_path in scored_files
     ]
+
+    if not args.no_latex_table:
+        table_path = write_latex_table(
+            summaries,
+            scored_paths=scored_files,
+            output=args.latex_table,
+            caption=args.latex_caption,
+            label=args.latex_label,
+        )
+        print(f"[audit] wrote LaTeX table: {table_path}", file=sys.stderr)
 
     if not args.tsv:
         print_compact_table(summaries, details=args.details)
@@ -286,8 +439,6 @@ def main() -> None:
         "contains_alias",
         "answer_contains_prediction",
     ]
-    import sys
-
     out_writer = csv.DictWriter(sys.stdout, fieldnames=fieldnames, delimiter="\t")
     out_writer.writeheader()
     for summary in summaries:

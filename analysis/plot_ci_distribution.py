@@ -52,6 +52,117 @@ MODEL_MARKERS = {
 }
 
 
+def _ci_bins(max_ci: int) -> tuple[list[int], list[str]]:
+    """Half-open histogram bin edges + labels for cᵢ in [1, max_ci].
+
+    Singleton bins {1} and {2}, then doubling-width bins ({3-4}, {5-8}, …),
+    truncated so the last bin ends at max_ci.  For max_ci=256 this reproduces
+    the original [1, 2, 3-4, …, 129-256] bins exactly; for RSA (max_ci=16) it
+    stops at {9-16}.
+    """
+    edges = [1, 2, 3]
+    while edges[-1] <= max_ci:
+        edges.append(2 * edges[-1] - 1)  # 3,5,9,17,33,… (upper edge doubles-1)
+    # Keep only edges up to the one that covers max_ci, then cap.
+    edges = [e for e in edges if e - 1 < max_ci]
+    if edges[-1] != max_ci + 1:
+        edges.append(max_ci + 1)
+    labels = []
+    for i in range(len(edges) - 1):
+        a = edges[i]
+        b = edges[i + 1] - 1
+        labels.append(str(a) if a == b else f"{a}-{b}")
+    return edges, labels
+
+
+def _ci_ticks(max_ci: int) -> list[int]:
+    """Log2 ticks 1,2,4,… up to and including max_ci."""
+    ticks = [1]
+    while ticks[-1] < max_ci:
+        ticks.append(ticks[-1] * 2)
+    if ticks[-1] != max_ci:
+        ticks[-1] = max_ci
+    return ticks
+
+
+def _ci_summary_rows(
+    models: dict[str, dict],
+    order: list[str],
+    ci_key: str,
+) -> list[dict]:
+    """Per-model cᵢ summary rows for the table (both stdout and LaTeX)."""
+    rows = []
+    for size in order:
+        m = models[size]
+        ci_pos = [c for c in m[ci_key] if c >= 1]
+        total = m["total"]
+        n_solved = len(ci_pos)
+        if n_solved == 0:
+            continue
+        rows.append({
+            "label": m["label"],
+            "total": total,
+            "solved": n_solved,
+            "solved_pct": n_solved / total * 100 if total else 0.0,
+            "mean_ci": float(np.mean(ci_pos)),
+            "median_ci": float(np.median(ci_pos)),
+            "ci_eq1_pct": sum(1 for c in ci_pos if c == 1) / n_solved * 100,
+            "ci_le2_pct": sum(1 for c in ci_pos if c <= 2) / n_solved * 100,
+            "ci_le4_pct": sum(1 for c in ci_pos if c <= 4) / n_solved * 100,
+        })
+    return rows
+
+
+def _print_ci_table(rows: list[dict], ci_label: str, max_ci: int) -> None:
+    """Print a plain-text cᵢ summary table to stdout."""
+    header = (f"{'Model':<14} {'Examples':>9} {'Solved':>16} "
+              f"{'mean cᵢ':>8} {'med':>4} "
+              f"{'cᵢ=1':>7} {'cᵢ≤2':>7} {'cᵢ≤4':>7}")
+    print(f"\ncᵢ distribution ({ci_label}, out of {max_ci}):")
+    print(header)
+    print("-" * len(header))
+    for r in rows:
+        print(f"{r['label']:<14} {r['total']:>9,} "
+              f"{r['solved']:>8,} ({r['solved_pct']:>4.1f}%) "
+              f"{r['mean_ci']:>8.1f} {r['median_ci']:>4.0f} "
+              f"{r['ci_eq1_pct']:>6.1f}% {r['ci_le2_pct']:>6.1f}% {r['ci_le4_pct']:>6.1f}%")
+
+
+def _latex_ci_table(
+    rows: list[dict],
+    ci_label: str,
+    max_ci: int,
+    caption: str,
+    table_label: str,
+) -> str:
+    """Build a booktabs LaTeX table of the cᵢ summary."""
+    ci_math = r"\text{sup-}c_i" if "supported" in ci_label else "c_i"
+    ci_tex = f"${ci_math}$"
+    lines = [
+        r"% Requires \usepackage{booktabs}",
+        r"\begin{table}[t]",
+        r"\centering",
+        r"\small",
+        rf"\caption{{{caption}}}",
+        rf"\label{{{table_label}}}",
+        r"\begin{tabular}{lrrrrrrr}",
+        r"\toprule",
+        (rf"Model & Examples & Solved & Mean {ci_tex} & Med & "
+         rf"${ci_math}{{=}}1$ & ${ci_math}{{\leq}}2$ & ${ci_math}{{\leq}}4$ \\"),
+        r"\midrule",
+    ]
+    for r in rows:
+        lines.append(
+            f"{r['label']} & {r['total']:,} & "
+            f"{r['solved']:,} ({r['solved_pct']:.1f}\\%) & "
+            f"{r['mean_ci']:.1f} & {r['median_ci']:.0f} & "
+            f"{r['ci_eq1_pct']:.1f}\\% & {r['ci_le2_pct']:.1f}\\% & "
+            f"{r['ci_le4_pct']:.1f}\\% \\\\"
+        )
+    lines.extend([r"\bottomrule", r"\end{tabular}", r"\end{table}"])
+    return "\n".join(lines) + "\n"
+
+
 def _model_label_from_path(path: str) -> str:
     m = re.search(r"qwen_qwen3-vl-(\d+b)", path)
     if m:
@@ -211,6 +322,19 @@ def main():
                         help="Do not draw figure titles.")
     parser.add_argument("--no-grid", action="store_true",
                         help="Do not draw the background grid.")
+    parser.add_argument("--max-ci", type=int, default=None,
+                        help="Max cᵢ (rollouts per example) for axis scaling. "
+                             "Default: auto-detect from the data (e.g. 256 for "
+                             "naive sampling, 16 for RSA n=16). Controls the "
+                             "histogram bins and the CDF x-axis extent.")
+    parser.add_argument("--latex-table", default=None,
+                        help="Optional path to write a booktabs LaTeX table of "
+                             "the cᵢ summary (solved %, mean/median cᵢ, "
+                             "cᵢ=1/≤2/≤4 fractions).")
+    parser.add_argument("--latex-caption", default=None,
+                        help="Caption for --latex-table (default: auto).")
+    parser.add_argument("--latex-label", default="tab:ci-distribution",
+                        help="LaTeX \\label for --latex-table.")
     parser.add_argument("--title", default=None)
     args = parser.parse_args()
 
@@ -298,9 +422,37 @@ def main():
 
     _set_thesis_style()
 
-    bin_edges = [1, 2, 3, 5, 9, 17, 33, 65, 129, 257]
-    bin_labels = ["1", "2", "3-4", "5-8", "9-16", "17-32", "33-64", "65-128", "129-256"]
     order = [size for size in MODEL_ORDER if size in models]
+
+    # Determine the rollout budget (max cᵢ) so the axes fit the data: 256 for
+    # naive sampling, 16 for RSA n=16, etc.  Auto-detect from the observed cᵢ
+    # unless overridden with --max-ci.
+    if args.max_ci is not None:
+        max_ci = args.max_ci
+    else:
+        observed = max(
+            (max(models[s][ci_key], default=0) for s in order),
+            default=256,
+        )
+        max_ci = observed if observed > 0 else 256
+
+    bin_edges, bin_labels = _ci_bins(max_ci)
+    cdf_ticks = _ci_ticks(max_ci)
+
+    # ── Summary table (stdout always; LaTeX on request) ─────────────
+    table_rows = _ci_summary_rows(models, order, ci_key)
+    _print_ci_table(table_rows, ci_label, max_ci)
+    if args.latex_table:
+        caption = args.latex_caption or (
+            f"Distribution of {'supported ' if args.supported else ''}"
+            f"correct rollouts per example ($c_i$, out of {max_ci}) among "
+            f"examples solved at least once."
+        )
+        latex = _latex_ci_table(table_rows, ci_label, max_ci, caption, args.latex_label)
+        out = Path(args.latex_table)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(latex)
+        print(f"Saved LaTeX table: {out}")
 
     def draw_hist(ax) -> None:
         x = np.arange(len(bin_labels))
@@ -341,7 +493,7 @@ def main():
                             fontweight="bold",
                         )
 
-        ax.set_xlabel(f"{ci_label} out of 256", fontsize=13)
+        ax.set_xlabel(f"{ci_label} out of {max_ci}", fontsize=13)
         ax.set_ylabel("Fraction of solved examples (%)", fontsize=13)
         if not args.no_title:
             ax.set_title(f"Histogram of {ci_label} among solved examples", fontsize=15, fontweight="bold")
@@ -392,10 +544,10 @@ def main():
         if not args.no_title:
             ax.set_title(f"CDF of {ci_label} among solved examples", fontsize=15, fontweight="bold")
         ax.set_xscale("log", base=2)
-        ax.set_xlim(1, 256)
+        ax.set_xlim(1, max_ci)
         ax.set_ylim(0, 1.02)
-        ax.set_xticks([1, 2, 4, 8, 16, 32, 64, 128, 256])
-        ax.set_xticklabels(["1", "2", "4", "8", "16", "32", "64", "128", "256"])
+        ax.set_xticks(cdf_ticks)
+        ax.set_xticklabels([str(t) for t in cdf_ticks])
         ax.legend(title="Model", fontsize=10, title_fontsize=11, frameon=True)
         _style_axes(ax, show_grid=not args.no_grid)
 

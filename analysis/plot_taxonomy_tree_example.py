@@ -29,22 +29,11 @@ class LeafInfo:
     entity_id: str
     image_id: str
     color: str
+    x: float
     y: float
 
 
-NODE_HALF_WIDTH = {
-    "root": 0.24,
-    "work": 0.30,
-    "architectural": 0.54,
-    "building": 0.39,
-    "stadium": 0.37,
-    "baseball": 0.45,
-    "entity": 0.29,
-    "object": 0.30,
-    "physical": 0.70,
-    "organisms": 0.64,
-    "taxon": 0.31,
-}
+NODE_HALF_HEIGHT = 0.16
 
 
 def set_style() -> None:
@@ -119,16 +108,17 @@ def center_crop_square(image):
 def draw_leaf_card_with_image(
     ax,
     *,
-    left: float,
+    center_x: float,
     leaf: LeafInfo,
     image_dir: Path,
-    width: float = 3.05,
-    height: float = 0.68,
+    width: float = 3.60,
+    height: float = 1.12,
 ) -> None:
     import matplotlib.image as mpimg
     import matplotlib.patheffects as pe
     from matplotlib.patches import FancyBboxPatch, Rectangle
 
+    left = center_x - width / 2
     bottom = leaf.y - height / 2
     card = FancyBboxPatch(
         (left, bottom),
@@ -152,7 +142,7 @@ def draw_leaf_card_with_image(
     )
     ax.add_patch(card)
 
-    pad = 0.08
+    pad = 0.11
     thumb = height - 2 * pad
     thumb_left = left + pad
     thumb_bottom = leaf.y - thumb / 2
@@ -182,7 +172,7 @@ def draw_leaf_card_with_image(
             "image\nmissing",
             ha="center",
             va="center",
-            fontsize=6.8,
+            fontsize=7.2,
             color=MUTED,
             zorder=7,
         )
@@ -201,21 +191,21 @@ def draw_leaf_card_with_image(
     text_left = thumb_left + thumb + 0.14
     ax.text(
         text_left,
-        leaf.y + 0.13,
+        leaf.y + 0.16,
         leaf.label,
         ha="left",
         va="center",
-        fontsize=10.1,
+        fontsize=9.7,
         color=INK,
         zorder=7,
     )
     ax.text(
         text_left,
-        leaf.y - 0.13,
+        leaf.y - 0.14,
         f"{leaf.entity_id}  |  {leaf.image_id}",
         ha="left",
         va="center",
-        fontsize=9.3,
+        fontsize=8.2,
         color=MUTED,
         zorder=7,
     )
@@ -281,17 +271,17 @@ def build_figure(
 
     set_style()
 
-    fig, ax = plt.subplots(figsize=(14.0, 6.4))
-    ax.set_xlim(-0.35, 11.0)
-    ax.set_ylim(-0.25, 4.15 if with_title else 3.76)
+    fig, ax = plt.subplots(figsize=(12.4, 12.0 if with_title else 11.2))
+    ax.set_xlim(0.0, 12.4)
+    ax.set_ylim(-0.05, 11.6 if with_title else 10.95)
     ax.axis("off")
 
     # Subtle branch panels.
     ax.add_patch(
         Rectangle(
-            (0.75, 1.68),
-            9.85,
-            2.05,
+            (0.15, 0.35),
+            7.95,
+            8.10,
             facecolor=BLUE,
             alpha=0.035,
             edgecolor="none",
@@ -300,9 +290,9 @@ def build_figure(
     )
     ax.add_patch(
         Rectangle(
-            (0.75, 0.08),
-            9.85,
-            1.15,
+            (8.20, 0.35),
+            3.95,
+            8.10,
             facecolor=GREEN,
             alpha=0.035,
             edgecolor="none",
@@ -312,8 +302,8 @@ def build_figure(
 
     if with_title:
         ax.text(
-            0.0,
-            3.95,
+            0.35,
+            11.35,
             "Example OVEN Taxonomy Chains",
             ha="left",
             va="top",
@@ -322,8 +312,8 @@ def build_figure(
             color=INK,
         )
         ax.text(
-            0.0,
-            3.68,
+            0.35,
+            11.02,
             "Two leaves share the same domain and parent; the third follows a different domain.",
             ha="left",
             va="top",
@@ -333,48 +323,46 @@ def build_figure(
 
     # Node coordinates.
     nodes: dict[str, tuple[float, float, str, str]] = {
-        "root": (0.45, 2.12, "root", INK),
-        "work": (1.55, 2.70, "work", BLUE),
-        "architectural": (2.85, 2.70, "architectural\nstructure", BLUE),
-        "building": (4.05, 2.70, "building", BLUE),
-        "stadium": (5.05, 2.70, "stadium", BLUE),
-        "baseball": (6.20, 2.70, "baseball\nvenue", BLUE),
-        "entity": (1.55, 0.68, "entity", GREEN),
-        "object": (2.55, 0.68, "object", GREEN),
-        "physical": (3.85, 0.68, "group/class of\nphysical objects", GREEN),
-        "organisms": (5.35, 0.68, "group/class of\norganisms", GREEN),
-        "taxon": (6.55, 0.68, "taxon", GREEN),
+        "root": (6.25, 10.12, "root", INK),
+        "work": (4.08, 8.98, "work", BLUE),
+        "architectural": (4.08, 7.95, "architectural\nstructure", BLUE),
+        "building": (4.08, 6.90, "building", BLUE),
+        "stadium": (4.08, 5.85, "stadium", BLUE),
+        "baseball": (4.08, 4.78, "baseball\nvenue", BLUE),
+        "entity": (10.10, 8.98, "entity", GREEN),
+        "object": (10.10, 7.95, "object", GREEN),
+        "physical": (10.10, 6.90, "group/class of\nphysical objects", GREEN),
+        "organisms": (10.10, 5.85, "group/class of\norganisms", GREEN),
+        "taxon": (10.10, 4.78, "taxon", GREEN),
     }
 
-    def left_edge(key: str) -> tuple[float, float]:
+    def top_edge(key: str) -> tuple[float, float]:
         x, y = nodes[key][:2]
-        return (x - NODE_HALF_WIDTH[key], y)
+        return (x, y + NODE_HALF_HEIGHT)
 
-    def right_edge(key: str) -> tuple[float, float]:
+    def bottom_edge(key: str) -> tuple[float, float]:
         x, y = nodes[key][:2]
-        return (x + NODE_HALF_WIDTH[key], y)
+        return (x, y - NODE_HALF_HEIGHT)
 
     # Edges: shared branch and different-domain branch. Coordinates terminate at
     # approximate box/card boundaries so the lines do not run through labels.
     shared = ["root", "work", "architectural", "building", "stadium", "baseball"]
     other = ["root", "entity", "object", "physical", "organisms", "taxon"]
     for a, b in zip(shared, shared[1:]):
-        start = (nodes["root"][0] + NODE_HALF_WIDTH["root"], nodes["root"][1] + 0.05) if a == "root" else right_edge(a)
-        draw_edge(ax, start, left_edge(b), color=BLUE, rad=0.08 if a == "root" else 0.0)
+        start = bottom_edge(a)
+        draw_edge(ax, start, top_edge(b), color=BLUE, rad=0.08 if a == "root" else 0.0)
     for a, b in zip(other, other[1:]):
-        start = (nodes["root"][0] + 0.08, nodes["root"][1] - 0.14) if a == "root" else right_edge(a)
-        draw_edge(ax, start, left_edge(b), color=GREEN, rad=-0.08 if a == "root" else 0.0)
+        start = bottom_edge(a)
+        draw_edge(ax, start, top_edge(b), color=GREEN, rad=-0.08 if a == "root" else 0.0)
 
     leaves = [
-        LeafInfo("Nationals Park", "Q517545", "oven_04944518", BLUE, 3.10),
-        LeafInfo("Fenway Park", "Q49136", "oven_04951065", BLUE, 2.28),
-        LeafInfo("Greater Antillean Grackle", "Q577270", "oven_04967883", GREEN, 0.68),
+        LeafInfo("Nationals Park", "Q517545", "oven_04944518", BLUE, 2.15, 2.42),
+        LeafInfo("Fenway Park", "Q49136", "oven_04951065", BLUE, 6.00, 2.42),
+        LeafInfo("Greater Antillean Grackle", "Q577270", "oven_04967883", GREEN, 10.10, 2.42),
     ]
-    leaf_card_left = 7.56
     for leaf in leaves[:2]:
-        offset = 0.08 if leaf.y > nodes["baseball"][1] else -0.08
-        draw_edge(ax, (right_edge("baseball")[0], nodes["baseball"][1] + offset), (leaf_card_left, leaf.y), color=BLUE, rad=0.08)
-    draw_edge(ax, right_edge("taxon"), (leaf_card_left, leaves[2].y), color=GREEN, rad=0.0)
+        draw_edge(ax, bottom_edge("baseball"), (leaf.x, leaf.y + 0.56), color=BLUE, rad=0.10 if leaf.x < nodes["baseball"][0] else -0.10)
+    draw_edge(ax, bottom_edge("taxon"), (leaves[2].x, leaves[2].y + 0.56), color=GREEN, rad=0.0)
 
     for key, (x, y, label, color) in nodes.items():
         draw_box(
@@ -390,11 +378,11 @@ def build_figure(
         )
 
     for leaf in leaves:
-        draw_leaf_card_with_image(ax, left=leaf_card_left, leaf=leaf, image_dir=image_dir)
+        draw_leaf_card_with_image(ax, center_x=leaf.x, leaf=leaf, image_dir=image_dir)
 
-    draw_badge(ax, x=5.85, y=3.36, text="shared parent", color=BLUE)
+    draw_badge(ax, x=4.08, y=3.62, text="shared parent", color=BLUE)
     # Thin separators to make the branch split obvious without adding a grid.
-    ax.plot([0.75, 10.6], [1.49, 1.49], color=GRID, linewidth=1.0, alpha=0.75)
+    ax.plot([8.15, 8.15], [0.35, 8.45], color=GRID, linewidth=1.0, alpha=0.75)
 
     output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output, dpi=180, bbox_inches="tight")

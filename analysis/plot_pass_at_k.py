@@ -483,7 +483,7 @@ def plot_pass_at_k(
         framealpha=0.92,
         borderpad=0.7,
         loc="upper left",
-        bbox_to_anchor=(1.01, 1.0),
+        bbox_to_anchor=(1.05, 1.0),
     )
     model_legend.get_frame().set_edgecolor("#D8D3CA")
     ax.add_artist(model_legend)
@@ -503,7 +503,7 @@ def plot_pass_at_k(
             framealpha=0.92,
             borderpad=0.7,
             loc="upper left",
-            bbox_to_anchor=(1.01, 0.58),
+            bbox_to_anchor=(1.05, 0.58),
         )
         method_legend.get_frame().set_edgecolor("#D8D3CA")
 
