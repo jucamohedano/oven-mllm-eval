@@ -24,16 +24,14 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from pathlib import Path
 
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-def pass_at_k(n: int, c: int, k: int) -> float:
-    """Unbiased pass@k estimator (Chen et al., 2021 — Codex form)."""
-    if n - c < k:
-        return 1.0
-    return float(1.0 - np.prod(1.0 - k / np.arange(n - c + 1, n + 1)))
+from oven_mllm_eval.pass_at_k import pass_at_k
 
 
 def _load_judge_metadata(judged_path: Path) -> dict:
