@@ -12,15 +12,10 @@ import argparse
 from dataclasses import dataclass
 from pathlib import Path
 
+from _common import BG, BLUE, GREEN, GRID, INK, MUTED, ORANGE, center_crop_square, set_style
 
-BG = "#fffdfa"
+
 PANEL = "#f8f6f0"
-INK = "#2f2f2f"
-MUTED = "#6b675f"
-GRID = "#ded9ce"
-BLUE = "#0072B2"
-GREEN = "#009E73"
-ORANGE = "#E69F00"
 VERMILLION = "#D55E00"
 
 
@@ -53,22 +48,6 @@ LEVELS = [
 ]
 
 
-def set_style() -> None:
-    import matplotlib.pyplot as plt
-
-    plt.rcParams.update(
-        {
-            "figure.facecolor": BG,
-            "axes.facecolor": BG,
-            "savefig.facecolor": BG,
-            "font.family": "serif",
-            "font.serif": ["DejaVu Serif", "Times New Roman", "Times"],
-            "text.color": INK,
-            "axes.labelcolor": INK,
-        }
-    )
-
-
 def _hex_to_rgb(color: str) -> tuple[float, float, float]:
     color = color.lstrip("#")
     return tuple(int(color[i : i + 2], 16) / 255 for i in (0, 2, 4))
@@ -83,14 +62,6 @@ def blend(color_a: str, color_b: str, weight_b: float) -> str:
     rgb_b = _hex_to_rgb(color_b)
     rgb = tuple((1 - weight_b) * a + weight_b * b for a, b in zip(rgb_a, rgb_b))
     return _rgb_to_hex(rgb)
-
-
-def center_crop_square(image):
-    height, width = image.shape[:2]
-    side = min(height, width)
-    y0 = (height - side) // 2
-    x0 = (width - side) // 2
-    return image[y0 : y0 + side, x0 : x0 + side]
 
 
 def draw_photo_card(ax, image_path: Path) -> None:

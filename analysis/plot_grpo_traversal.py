@@ -35,29 +35,11 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from _common import apply_thesis_style
+
 PREFIX = "val-aux/oven_taxonomy_reasoning/"
 CORE = "val-core/oven_taxonomy_reasoning/"
 
-
-def apply_thesis_style():
-    """Match the thesis plot aesthetic (see analysis/plot_pass_at_k.py)."""
-    import seaborn as sns
-
-    sns.set_theme(
-        context="talk",
-        style="whitegrid",
-        rc={
-            "axes.facecolor": "#FBFAF7",
-            "figure.facecolor": "white",
-            "axes.edgecolor": "#3A3A3A",
-            "axes.labelcolor": "#202020",
-            "text.color": "#202020",
-            "grid.color": "#D8D3CA",
-            "grid.linewidth": 0.9,
-            "font.family": "DejaVu Serif",
-        },
-    )
-    return sns
 
 # Standard-prompt greedy baseline (July-7 runs, uniformly flat ~= base policy).
 # Taken from viz/grpo/grpo_results_table.md (agg08 final step).

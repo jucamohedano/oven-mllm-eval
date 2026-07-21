@@ -34,26 +34,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-
-def apply_thesis_style():
-    """Match the thesis plot aesthetic (see analysis/plot_pass_at_k.py)."""
-    import seaborn as sns
-
-    sns.set_theme(
-        context="talk",
-        style="whitegrid",
-        rc={
-            "axes.facecolor": "#FBFAF7",
-            "figure.facecolor": "white",
-            "axes.edgecolor": "#3A3A3A",
-            "axes.labelcolor": "#202020",
-            "text.color": "#202020",
-            "grid.color": "#D8D3CA",
-            "grid.linewidth": 0.9,
-            "font.family": "DejaVu Serif",
-        },
-    )
-    return sns
+from _common import apply_thesis_style
 
 
 # Okabe-Ito palette, consistent with the other viz scripts in this repo.

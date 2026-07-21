@@ -6,37 +6,16 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from _common import BG, BLUE, GREEN, GRID, INK, MUTED, ORANGE, set_style
 
-BG = "#fffdfa"
+
 PANEL = "#f8f6f0"
-INK = "#2f2f2f"
-MUTED = "#6b675f"
-GRID = "#ded9ce"
-BLUE = "#0072B2"
-GREEN = "#009E73"
-ORANGE = "#E69F00"
 VERMILLION = "#D55E00"
 PURPLE = "#6A5ACD"
 
 DEFAULT_OUTPUT = "viz/architectures/qwen3_vl_simplified_architecture.png"
 DEFAULT_PDF = "viz/architectures/qwen3_vl_simplified_architecture.pdf"
 DEFAULT_SVG = "viz/architectures/qwen3_vl_simplified_architecture.svg"
-
-
-def set_style() -> None:
-    import matplotlib.pyplot as plt
-
-    plt.rcParams.update(
-        {
-            "figure.facecolor": BG,
-            "axes.facecolor": BG,
-            "savefig.facecolor": BG,
-            "font.family": "serif",
-            "font.serif": ["DejaVu Serif", "Times New Roman", "Times"],
-            "text.color": INK,
-            "axes.labelcolor": INK,
-        }
-    )
 
 
 def draw_round_box(

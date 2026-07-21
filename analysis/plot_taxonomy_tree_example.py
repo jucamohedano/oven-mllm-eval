@@ -12,14 +12,9 @@ import argparse
 from dataclasses import dataclass
 from pathlib import Path
 
+from _common import BG, BLUE, GREEN, GRID, INK, MUTED, ORANGE, center_crop_square, set_style
 
-BG = "#fffdfa"
-INK = "#2f2f2f"
-MUTED = "#6b675f"
-GRID = "#ded9ce"
-BLUE = "#0072B2"
-ORANGE = "#E69F00"
-GREEN = "#009E73"
+
 VERMILLION = "#D55E00"
 
 
@@ -34,22 +29,6 @@ class LeafInfo:
 
 
 NODE_HALF_HEIGHT = 0.16
-
-
-def set_style() -> None:
-    import matplotlib.pyplot as plt
-
-    plt.rcParams.update(
-        {
-            "figure.facecolor": BG,
-            "axes.facecolor": BG,
-            "savefig.facecolor": BG,
-            "font.family": "serif",
-            "font.serif": ["DejaVu Serif", "Times New Roman", "Times"],
-            "text.color": INK,
-            "axes.labelcolor": INK,
-        }
-    )
 
 
 def draw_box(
@@ -95,14 +74,6 @@ def draw_box(
             )
         ]
     )
-
-
-def center_crop_square(image):
-    height, width = image.shape[:2]
-    side = min(height, width)
-    y0 = (height - side) // 2
-    x0 = (width - side) // 2
-    return image[y0 : y0 + side, x0 : x0 + side]
 
 
 def draw_leaf_card_with_image(
