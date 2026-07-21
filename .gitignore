@@ -42,4 +42,11 @@ uv.lock
 configs/sync.conf
 commands.md
 data/processed/vlm_compatible_val_aligned.jsonl
+data/raw/
+data/available_images.txt
 viz/
+docs/
+CLAUDE.md
+tests/
+.mplconfig/
+lib/
