@@ -7,14 +7,17 @@ from the ``images=[{"image": "file:///..."}]`` field at training time.
 
 from __future__ import annotations
 
+import sys
 import argparse
 import json
 import random
-import re
-import unicodedata
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+from oven_mllm_eval.boxed import extract_boxed_answer, normalize_answer
 
 
 DIRECT_SYSTEM_PROMPT = """You are a vision-language model for open-world image classification.
@@ -269,50 +272,6 @@ def load_chain_file(path: Path | None) -> dict[str, list[str]]:
     return chains
 
 
-def _strip_latex_answer(answer: str) -> str:
-    answer = answer.strip().strip("$").strip().strip(".").strip()
-    wrappers = (r"\text", r"\mathrm", r"\operatorname", r"\mathbf")
-    changed = True
-    while changed:
-        changed = False
-        for wrapper in wrappers:
-            prefix = wrapper + "{"
-            if answer.startswith(prefix) and answer.endswith("}"):
-                answer = answer[len(prefix):-1].strip()
-                changed = True
-    return answer.strip().strip("$").strip().strip(".").strip()
-
-
-def extract_boxed_answer(text: str) -> tuple[str, bool]:
-    matches = []
-    start = 0
-    needle = r"\boxed{"
-    while True:
-        box_start = text.find(needle, start)
-        if box_start < 0:
-            break
-        content_start = box_start + len(needle)
-        depth = 1
-        idx = content_start
-        while idx < len(text) and depth > 0:
-            char = text[idx]
-            if char == "{":
-                depth += 1
-            elif char == "}":
-                depth -= 1
-            idx += 1
-        if depth == 0:
-            answer = _strip_latex_answer(text[content_start:idx - 1])
-            if answer:
-                matches.append(answer)
-            start = idx
-        else:
-            break
-    if matches:
-        return matches[-1], True
-    return text.strip(), False
-
-
 def _candidate_list(row: dict[str, Any]) -> list[str]:
     """Return cached solution traces from an RSA solution-mode row."""
     for key in ("rsa_initial_solutions", "candidate_solutions"):
@@ -498,15 +457,6 @@ def build_direct_prompt(question: str, evidence_lines: list[str]) -> list[dict[s
         {"role": "system", "content": DIRECT_SYSTEM_PROMPT},
         {"role": "user", "content": "\n\n".join(user_parts)},
     ]
-
-
-def normalize_answer(text: str) -> str:
-    text = unicodedata.normalize("NFKC", text)
-    text = text.lower().strip()
-    text = text.replace("_", " ").replace("-", " ")
-    text = re.sub(r"\\[a-zA-Z]+\{([^{}]*)\}", r"\1", text)
-    text = re.sub(r"[^a-z0-9]+", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
 
 
 @lru_cache(maxsize=1)

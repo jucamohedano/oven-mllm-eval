@@ -35,6 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from oven_mllm_eval.io import append_jsonl
 from oven_mllm_eval.prompts import PROMPT_VARIANTS, get_prompt
+from oven_mllm_eval.boxed import extract_boxed_answer
 
 
 RSA_METHOD = "recursive-self-aggregation"
@@ -253,51 +254,6 @@ def _sample_subsets(
         return [[] for _ in range(n_subsets)]
     k_eff = min(k, len(population))
     return [rng.sample(population, k_eff) for _ in range(n_subsets)]
-
-
-def _strip_latex_answer(answer: str) -> str:
-    answer = answer.strip().strip("$").strip().strip(".").strip()
-    wrappers = (r"\text", r"\mathrm", r"\operatorname", r"\mathbf")
-    changed = True
-    while changed:
-        changed = False
-        for wrapper in wrappers:
-            prefix = wrapper + "{"
-            if answer.startswith(prefix) and answer.endswith("}"):
-                answer = answer[len(prefix):-1].strip()
-                changed = True
-    return answer.strip().strip("$").strip().strip(".").strip()
-
-
-def extract_boxed_answer(text: str) -> tuple[str, bool]:
-    """Extract the last ``\boxed{...}`` answer, supporting nested braces."""
-    matches = []
-    start = 0
-    needle = r"\boxed{"
-    while True:
-        box_start = text.find(needle, start)
-        if box_start < 0:
-            break
-        content_start = box_start + len(needle)
-        depth = 1
-        idx = content_start
-        while idx < len(text) and depth > 0:
-            char = text[idx]
-            if char == "{":
-                depth += 1
-            elif char == "}":
-                depth -= 1
-            idx += 1
-        if depth == 0:
-            answer = _strip_latex_answer(text[content_start:idx - 1])
-            if answer:
-                matches.append(answer)
-            start = idx
-        else:
-            break
-    if matches:
-        return matches[-1], True
-    return text.strip(), False
 
 
 def build_oven_initial_solution_prompt(question: str) -> str:
