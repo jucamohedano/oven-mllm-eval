@@ -18,6 +18,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from oven_mllm_eval.boxed import extract_boxed_answer, normalize_answer
+from oven_mllm_eval.paths import path_variants
 
 
 DIRECT_SYSTEM_PROMPT = """You are a vision-language model for open-world image classification.
@@ -331,14 +332,6 @@ def select_val_qids(qids: set[str], fraction: float, seed: int) -> set[str]:
     return set(ordered[:count])
 
 
-def _path_variants(path: Path) -> list[Path]:
-    variants = [path]
-    for ext in (".jpg", ".jpeg", ".JPEG", ".JPG", ".png", ".PNG", ".webp", ".WEBP"):
-        if path.suffix != ext:
-            variants.append(path.with_suffix(ext))
-    return variants
-
-
 def image_uri(row: dict[str, Any], image_root: str | None) -> str:
     path = str(row.get("image_path") or "")
     if path.startswith(("file://", "http://", "https://")):
@@ -365,7 +358,7 @@ def image_uri(row: dict[str, Any], image_root: str | None) -> str:
 
     seen: set[str] = set()
     for candidate in candidates:
-        for variant in _path_variants(candidate):
+        for variant in path_variants(candidate):
             key = str(variant)
             if key in seen:
                 continue

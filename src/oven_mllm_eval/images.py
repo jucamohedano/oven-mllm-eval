@@ -11,6 +11,8 @@ from pathlib import Path
 
 from PIL import Image
 
+from oven_mllm_eval.paths import IMAGE_EXTENSIONS
+
 __all__ = [
     "load_pil",
     "resolve_image_path",
@@ -25,7 +27,7 @@ def load_pil(path: str) -> Image.Image:
         raise ValueError("Empty image_path in example")
     p = Path(path)
     if not p.exists():
-        for ext in (".JPEG", ".jpeg", ".JPG"):
+        for ext in IMAGE_EXTENSIONS:
             alt = p.with_suffix(ext)
             if alt.exists():
                 p = alt
@@ -48,7 +50,7 @@ def resolve_image_path(path: str, root: Path) -> str:
         raise ValueError("Empty image_path in example")
     p = Path(path) if Path(path).is_absolute() else root / path
     if not p.exists():
-        for ext in (".JPEG", ".jpeg", ".JPG"):
+        for ext in IMAGE_EXTENSIONS:
             alt = p.with_suffix(ext)
             if alt.exists():
                 return str(alt)

@@ -36,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from oven_mllm_eval.io import append_jsonl
 from oven_mllm_eval.prompts import PROMPT_VARIANTS, get_prompt
 from oven_mllm_eval.boxed import extract_boxed_answer
+from oven_mllm_eval.paths import path_variants
 
 
 RSA_METHOD = "recursive-self-aggregation"
@@ -149,14 +150,6 @@ def _global_done_ids(base_output: Path) -> set[str]:
     return done
 
 
-def _path_variants(path: Path) -> list[Path]:
-    variants = [path]
-    for ext in (".jpg", ".jpeg", ".JPEG", ".JPG", ".png", ".PNG", ".webp", ".WEBP"):
-        if path.suffix != ext:
-            variants.append(path.with_suffix(ext))
-    return variants
-
-
 def _resolve_image_path(row: dict[str, Any], root: Path) -> str:
     """Resolve image paths, including stale absolute paths from prepared JSONL.
 
@@ -190,7 +183,7 @@ def _resolve_image_path(row: dict[str, Any], root: Path) -> str:
     tried: list[str] = []
     seen: set[str] = set()
     for candidate in candidates:
-        for variant in _path_variants(candidate):
+        for variant in path_variants(candidate):
             key = str(variant)
             if key in seen:
                 continue

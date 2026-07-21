@@ -7,7 +7,12 @@ one-way dependency (analysis consumes the library, never the reverse) holds.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+from oven_mllm_eval.paths import IMAGE_EXTENSIONS
 
 __all__ = [
     "tex_escape",
@@ -19,8 +24,6 @@ __all__ = [
     "center_crop_square",
 ]
 
-# OVEN images are not consistently lowercase .jpg on disk.
-IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".JPEG", ".JPG", ".png")
 
 # Shared palette for the hand-drawn diagram figures. Colour-blind safe (Okabe-Ito).
 BG = "#fffdfa"

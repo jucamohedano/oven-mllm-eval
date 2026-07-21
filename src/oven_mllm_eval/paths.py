@@ -63,3 +63,27 @@ MODEL_OUTPUT = str(PROJECT_ROOT / "results" / "generations")
 MEASURE_SCORE_DIR = str(PROJECT_ROOT / "results" / "scores")
 ESTIMATE_DIR = str(PROJECT_ROOT / "results" / "estimates")
 CLIP_FOLDER = str(DATA_DIR / "clip")
+
+
+# ---------------------------------------------------------------------------
+# Image file extensions
+# ---------------------------------------------------------------------------
+# Single source of truth for "which extensions an OVEN image may use". Ordered:
+# the first match wins, so keep the common lowercase forms first. Resolution is
+# stat-based rather than a directory glob on purpose -- the image directory holds
+# 100k+ files and is probed once per example, so a glob would rescan the whole
+# directory per lookup (measured >3000x slower at 50k files).
+IMAGE_EXTENSIONS = (
+    ".jpg", ".jpeg", ".JPEG", ".JPG",
+    ".png", ".PNG",
+    ".webp", ".WEBP",
+)
+
+
+def path_variants(path: Path) -> list[Path]:
+    """The given path followed by the same stem under every known extension."""
+    variants = [path]
+    for ext in IMAGE_EXTENSIONS:
+        if path.suffix != ext:
+            variants.append(path.with_suffix(ext))
+    return variants
